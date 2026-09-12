@@ -292,6 +292,35 @@ class InterventionTests(unittest.TestCase):
             runtime.drain()
             self.assertEqual([len(messages) for messages in snapshots], [4, 5, 5])
 
+    def test_manual_malformed_or_none_result_is_silent(self):
+        for decision in (None, {}, {"action": "other"}, objection() | {"evidence_ids": []}):
+            with self.subTest(decision=decision):
+                responses = []
+                runtime = self.runtime(lambda messages: decision)
+                runtime.request_manual(lambda **payload: responses.append(payload))
+                runtime.drain()
+                self.assertEqual(responses, [])
+                self.assertEqual(self.client.posts, [])
+
+    def test_manual_abstention_invalidated_during_analysis_is_silent(self):
+        entered, release = threading.Event(), threading.Event()
+        responses = []
+
+        def analyze(messages):
+            entered.set()
+            release.wait(2)
+            return {"action": "abstain"}
+
+        runtime = self.runtime(analyze)
+        self.addCleanup(release.set)
+        runtime.request_manual(lambda **payload: responses.append(payload))
+        self.assertTrue(entered.wait(1))
+        self.assertTrue(runtime.handle_message(message_body("1")))
+        release.set()
+        runtime.drain()
+        self.assertEqual(responses, [])
+        self.assertEqual(self.client.posts, [])
+
     def test_dismissal_rejects_invalid_reactions_and_records_once(self):
         runtime = self.runtime(bot_user_id="UBOT")
         self.feed(runtime)

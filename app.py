@@ -183,6 +183,13 @@ class CounterpointRuntime:
     def _analyze(self, generation: int, respond=None) -> None:
         try:
             decision = self.analyzer(list(self.window))
+            with self._ingress_lock:
+                if generation != self._generation:
+                    return
+            if isinstance(decision, dict) and decision.get("action") == "abstain":
+                if respond is not None:
+                    respond(text="No evidence-backed objection to raise.", response_type="ephemeral")
+                return
             valid = (
                 isinstance(decision, dict)
                 and decision.get("action") == "object"
@@ -193,8 +200,6 @@ class CounterpointRuntime:
                 and all(isinstance(value, str) and value.strip() for value in decision["evidence_ids"])
             )
             if not valid or self._summary_key(decision["decision_summary"]) in self.suppressed_summaries:
-                if respond is not None:
-                    respond(text="No evidence-backed objection to raise.", response_type="ephemeral")
                 return
             payload = self._render_intervention(decision)
             with self._ingress_lock:

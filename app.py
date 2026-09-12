@@ -86,11 +86,13 @@ class CounterpointRuntime:
         self._worker.start()
 
     def stop(self) -> None:
-        worker = self._worker
-        if worker is None or self._stopped:
-            return
-        self._stopped = True
         with self._ingress_lock:
+            if self._stopped:
+                return
+            self._stopped = True
+            worker = self._worker
+            if worker is None:
+                return
             self.work_queue.put(("stop", None, self._generation))
         worker.join()
 
@@ -113,6 +115,8 @@ class CounterpointRuntime:
             else None
         )
         with self._ingress_lock:
+            if self._stopped:
+                return False
             if event_key is not None and event_key in self._seen_event_keys:
                 return False
             if event_key is not None:
@@ -127,9 +131,12 @@ class CounterpointRuntime:
 
         return True
 
-    def request_manual(self, respond=None) -> None:
+    def request_manual(self, respond=None) -> bool:
         with self._ingress_lock:
+            if self._stopped:
+                return False
             self.work_queue.put(("manual", respond, self._generation))
+        return True
 
     def handle_reaction(self, body: dict[str, object]) -> bool:
         event = body.get("event")
@@ -151,6 +158,8 @@ class CounterpointRuntime:
         ):
             return False
         with self._ingress_lock:
+            if self._stopped:
+                return False
             self.work_queue.put(("reaction", {"ts": item["ts"], "user": user}, self._generation))
         return True
 
@@ -206,7 +215,13 @@ class CounterpointRuntime:
                 and 1 <= len(decision["evidence_ids"]) <= 2
                 and all(isinstance(value, str) and value.strip() for value in decision["evidence_ids"])
             )
-            if not valid or self._summary_key(decision["decision_summary"]) in self.suppressed_summaries:
+            if not valid:
+                return
+            summary = self._summary_key(decision["decision_summary"])
+            if summary in self.suppressed_summaries or any(
+                self._summary_key(pending["decision_summary"]) == summary
+                for pending in self.pending.values()
+            ):
                 return
             payload = self._render_intervention(decision)
             with self._ingress_lock:
@@ -382,11 +397,22 @@ def start_production() -> None:
     slack_app = create_slack_app(runtime, config["SLACK_BOT_TOKEN"])
     runtime.slack_client = slack_app.client
     runtime.bot_user_id = slack_app.client.auth_test()["user_id"]
-    runtime.start()
+    handler = SocketModeHandler(slack_app, config["SLACK_APP_TOKEN"])
+    start_failed = False
     try:
-        SocketModeHandler(slack_app, config["SLACK_APP_TOKEN"]).start()
+        runtime.start()
+        handler.start()
+    except BaseException:
+        start_failed = True
+        raise
     finally:
-        runtime.stop()
+        try:
+            handler.close()
+        except Exception:
+            if not start_failed:
+                raise
+        finally:
+            runtime.stop()
 
 
 if __name__ == "__main__":

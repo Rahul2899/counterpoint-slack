@@ -89,6 +89,7 @@ _WHITESPACE_RE = re.compile(r"\s+")
 # Slack mention syntax, and links. Evidence lives in memory, not on the web.
 _UNSAFE_TEXT_RE = re.compile(
     r"<!(?:channel|here|everyone)>"
+    r"|<!subteam\^[A-Za-z0-9]+(?:\|[^>]*)?>"
     r"|<@[UWB][A-Za-z0-9]+>"
     r"|<#C[A-Za-z0-9]+(?:\|[^>]*)?>"
     r"|(?<![A-Za-z0-9_])@(?:channel|here|everyone)(?![A-Za-z0-9_])"
@@ -245,10 +246,10 @@ def _load_memory(path: Path) -> list[dict[str, str]]:
             raise ValueError(f"record {index} has unexpected fields: {sorted(extra)}")
         clean: dict[str, str] = {}
         for field in RECORD_FIELDS:
-            value = record.get(field)
-            if not isinstance(value, str) or not value.strip():
+            value = _clean_text(record.get(field))
+            if not value:
                 raise ValueError(f"record {index} has a missing or empty {field}")
-            clean[field] = _clean_text(value)
+            clean[field] = value
         if not _RECORD_ID_RE.match(clean["id"]):
             raise ValueError(f"record {index} has an unusable id")
         if clean["id"] in seen:
@@ -442,7 +443,7 @@ def _output_schema(memory: list[dict[str, str]]) -> dict[str, object]:
 
 
 def _build_prompt(messages: list[dict[str, str]], memory: list[dict[str, str]]) -> str:
-    """The complete memory and the complete ordered transcript, as data."""
+    """The complete memory and the bounded ordered transcript, as data."""
     return (
         "Decide whether to object or abstain for the discussion below.\n\n"
         "MEMORY (verified synthetic decision records, the only admissible "
@@ -480,7 +481,12 @@ def _normalize_messages(messages: object) -> list[dict[str, str]]:
             continue
         ts = _clean_text(item.get("ts"))[:32]
         user_id = _clean_text(item.get("user_id"))[:32]
-        text = _clean_text(item.get("text"))[:MAX_MESSAGE_CHARS]
+        text = _clean_text(item.get("text"))
+        if len(text) > MAX_MESSAGE_CHARS:
+            omission = " [middle omitted] "
+            available = MAX_MESSAGE_CHARS - len(omission)
+            head = available // 2
+            text = text[:head] + omission + text[-(available - head):]
         if not ts or not user_id or not text:
             continue
         window.append({"ts": ts, "user_id": user_id, "text": text})
@@ -592,8 +598,8 @@ def _coerce_object(value: object) -> object:
 def _extract_output(document: object, depth: int = 0) -> dict[str, object] | None:
     """Find the structured decision inside a run document, if it is there yet.
 
-    The Exa Agent API is beta, so the decision is located by a bounded search
-    through known envelope keys instead of one hard-coded path.
+    The documented structured field is authoritative, including null. Only
+    envelopes without it use the bounded search through compatibility keys.
     """
     node = _coerce_object(document)
     if not isinstance(node, dict):
@@ -602,6 +608,9 @@ def _extract_output(document: object, depth: int = 0) -> dict[str, object] | Non
         return node
     if depth >= MAX_OUTPUT_DEPTH:
         return None
+    output = _coerce_object(node.get("output"))
+    if isinstance(output, dict) and "structured" in output:
+        return _extract_output(output["structured"], depth + 2)
     for key in OUTPUT_CONTAINER_KEYS:
         if key in node:
             found = _extract_output(node[key], depth + 1)
@@ -661,6 +670,8 @@ def _analyze_window(messages: object) -> dict[str, object]:
             timeout=_request_timeout(deadline),
         )
     except ProviderError as exc:
+        if _now() >= deadline:
+            return _abstain("provider_timeout")
         return _provider_abstention("POST", exc)
 
     run_id = _extract_run_id(document)
@@ -668,11 +679,14 @@ def _analyze_window(messages: object) -> dict[str, object]:
     transient_failures = 0
 
     for _ in range(MAX_POLL_ATTEMPTS):
+        if _now() >= deadline:
+            return _abstain("provider_timeout")
         if status in COMPLETED_STATUSES:
             output = _extract_output(document)
             if output is None:
                 return _abstain("missing_output")
-            return _validate_decision(output, memory)
+            decision = _validate_decision(output, memory)
+            return _abstain("provider_timeout") if _now() >= deadline else decision
         if status in FAILED_STATUSES:
             LOGGER.warning("exa run ended as %s", _sanitize_reason(status))
             return _abstain("provider_failed")
@@ -693,6 +707,8 @@ def _analyze_window(messages: object) -> dict[str, object]:
                 "GET", run_url, api_key=api_key, timeout=_request_timeout(deadline)
             )
         except ProviderError as exc:
+            if _now() >= deadline:
+                return _abstain("provider_timeout")
             transient_failures += 1
             fatal = exc.status in FATAL_HTTP_STATUSES
             if fatal or transient_failures > MAX_TRANSIENT_POLL_FAILURES:
@@ -797,6 +813,10 @@ def main(argv: list[str] | None = None) -> int:
     expected_action = scenario["expected_action"]
     if decision["action"] != expected_action:
         print(f"MISMATCH: expected {expected_action}, agent chose {decision['action']}")
+        return 1
+    expected_ids = scenario["expected_evidence_ids"]
+    if decision["evidence_ids"] != expected_ids:
+        print(f"MISMATCH: expected evidence {expected_ids}, agent cited {decision['evidence_ids']}")
         return 1
     print(f"OK: the agent chose {expected_action} on its own")
     return 0

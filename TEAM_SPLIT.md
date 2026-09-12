@@ -1,4 +1,8 @@
-# Counterpoint Two-Person Split
+# Counterpoint Two-Person Split (Historical)
+
+Plan A and Plan B have been merged into `main`. This file preserves the
+hackathon collaboration boundary; use `README.md` for current setup and run
+instructions.
 
 Both builders branch from the planning-baseline commit on `origin/main`. The
 design and implementation plan are frozen during parallel work.
@@ -96,4 +100,3 @@ python3 -m unittest discover -s tests -v
 
 No PR may contain `.env`, tokens, copied API-key values, real private Slack
 messages, or screenshots showing secrets.
-

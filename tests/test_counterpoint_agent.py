@@ -6,6 +6,7 @@ transport is exercised only through a patched ``_request_json``.
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import re
@@ -140,6 +141,14 @@ class MemoryTests(unittest.TestCase):
         path = write_memory({"version": 1, "records": [broken]})
         with self.assertRaises(ValueError):
             _load_memory(path)
+
+    def test_fields_empty_after_control_character_sanitization_raise(self) -> None:
+        for field in counterpoint_agent.RECORD_FIELDS:
+            with self.subTest(field=field):
+                path = write_memory({"version": 1, "records": [dict(VALID_RECORD, **{field: "\x00\x08\x7f"})]})
+                self.addCleanup(path.unlink)
+                with self.assertRaises(ValueError):
+                    _load_memory(path)
 
     def test_duplicate_ids_raise(self) -> None:
         path = write_memory(
@@ -544,6 +553,38 @@ class RunLifecycleTests(ProviderTestCase):
         self.assertGreaterEqual(elapsed, counterpoint_agent.RUN_DEADLINE_SECONDS - 1)
         self.assertLessEqual(len(self.calls), 52)
 
+    def test_late_http_response_cannot_produce_a_decision(self) -> None:
+        for method in ("POST", "GET"):
+            for status in ("completed", "failed", "http_error"):
+                with self.subTest(method=method, status=status):
+                    self.clock.value = 1_000.0
+                    self.calls.clear()
+
+                    def responder(request_method, url, **kwargs):
+                        if request_method != method:
+                            return {"id": "run_late", "status": "running"}
+                        self.clock.sleep(counterpoint_agent.RUN_DEADLINE_SECONDS)
+                        if status == "http_error":
+                            raise counterpoint_agent.ProviderError("provider_http_error", 401)
+                        return {"id": "run_late", "status": status, "output": object_payload()}
+
+                    self.patch_transport(responder)
+                    self.assertEqual(
+                        counterpoint_agent.analyze_window(WINDOW), _abstain("provider_timeout")
+                    )
+
+    def test_deadline_is_checked_before_accepting_validated_output(self) -> None:
+        self.respond_with({"id": "run", "status": "completed", "output": object_payload()})
+
+        def validate(raw, memory):
+            self.clock.sleep(counterpoint_agent.RUN_DEADLINE_SECONDS)
+            return _validate_decision(raw, memory)
+
+        with mock.patch.object(counterpoint_agent, "_validate_decision", validate):
+            self.assertEqual(
+                counterpoint_agent.analyze_window(WINDOW), _abstain("provider_timeout")
+            )
+
     def test_http_error_abstains(self) -> None:
         self.respond_with(counterpoint_agent.ProviderError("provider_http_error", 500))
         self.assertEqual(
@@ -696,6 +737,23 @@ class WindowNormalizationTests(ProviderTestCase):
             len(self.sent_window()[0]["text"]), counterpoint_agent.MAX_MESSAGE_CHARS
         )
 
+    def test_long_message_keeps_tail_resolution_in_provider_input(self) -> None:
+        proposal = "Proposal: self-host authentication. "
+        resolution = " Brina owns session revocation, rollback, and the on-call rotation."
+        for size in (counterpoint_agent.MAX_MESSAGE_CHARS, 1_201, 5_000):
+            with self.subTest(size=size):
+                self.calls.clear()
+                text = proposal + "x" * (size - len(proposal) - len(resolution)) + resolution
+                counterpoint_agent.analyze_window([{"ts": "1.1", "user_id": "U1", "text": text}])
+                sent = self.sent_window()[0]["text"]
+                self.assertTrue(sent.startswith(proposal))
+                self.assertTrue(sent.endswith(resolution))
+                self.assertLessEqual(len(sent), counterpoint_agent.MAX_MESSAGE_CHARS)
+                if size > counterpoint_agent.MAX_MESSAGE_CHARS:
+                    self.assertIn("[middle omitted]", sent)
+                else:
+                    self.assertEqual(sent, text)
+
     def test_empty_window_abstains_without_a_call(self) -> None:
         for messages in ([], None, "text", [{"ts": "1.1"}]):
             with self.subTest(messages=messages):
@@ -811,6 +869,22 @@ class DocumentedEnvelopeTests(ProviderTestCase):
         self.assertEqual(
             counterpoint_agent.analyze_window(WINDOW), _abstain("missing_output")
         )
+
+    def test_null_structured_output_cannot_fall_back_to_text_json(self) -> None:
+        self.respond_with(
+            self.documented_run(
+                "completed", output={"structured": None, "text": json.dumps(object_payload())}
+            )
+        )
+        self.assertEqual(
+            counterpoint_agent.analyze_window(WINDOW), _abstain("missing_output")
+        )
+
+    def test_text_json_is_accepted_when_structured_is_absent(self) -> None:
+        self.respond_with(
+            self.documented_run("completed", output={"text": json.dumps(object_payload())})
+        )
+        self.assertEqual(counterpoint_agent.analyze_window(WINDOW)["action"], "object")
 
     def test_every_documented_failure_status_abstains(self) -> None:
         for status in ("failed", "cancelled"):
@@ -994,6 +1068,25 @@ class DemoTranscriptTests(ProviderTestCase):
                 speakers = {message["user_id"] for message in scenario["messages"]}
                 self.assertGreaterEqual(len(speakers), 2)
 
+    def test_demo_discussions_happen_after_every_memory_precedent(self) -> None:
+        latest_precedent = max(datetime.date.fromisoformat(record["date"]) for record in self.memory)
+        for name, scenario in self.scenarios.items():
+            with self.subTest(name=name):
+                for message in scenario["messages"]:
+                    message_date = datetime.datetime.fromtimestamp(float(message["ts"]), datetime.timezone.utc).date()
+                    self.assertGreater(message_date, latest_precedent)
+
+    def test_irrelevant_memory_is_a_consequential_grant_decision(self) -> None:
+        scenario = self.scenarios["irrelevant_memory"]
+        transcript = " ".join(message["text"] for message in scenario["messages"]).lower()
+        self.assertIn("100,000", transcript)
+        self.assertIn("grant", transcript)
+        self.assertIn("selection criteria", transcript)
+        self.assertIn("approved", transcript)
+        self.assertNotIn("grant", json.dumps(self.memory).lower())
+        self.assertEqual(scenario["expected_action"], "abstain")
+        self.assertEqual(scenario["expected_evidence_ids"], [])
+
     def test_expected_evidence_ids_exist_in_memory(self) -> None:
         known = {record["id"] for record in self.memory}
         for name, scenario in self.scenarios.items():
@@ -1072,7 +1165,7 @@ class DemoTranscriptTests(ProviderTestCase):
         decision = counterpoint_agent.analyze_window(list(scenario["messages"]))
         self.assertEqual(decision, _abstain("no_relevant_precedent"))
 
-    def test_invented_precedent_on_a_low_risk_decision_is_suppressed(self) -> None:
+    def test_invented_precedent_on_an_unrelated_decision_is_suppressed(self) -> None:
         self.respond_with(
             {
                 "id": "run_demo_4",
@@ -1149,6 +1242,15 @@ class ManualVerificationCliTests(ProviderTestCase):
         )
         with mock.patch("sys.stdout"):
             self.assertEqual(counterpoint_agent.main(["premature_auth_consensus"]), 0)
+
+    def test_matching_action_with_wrong_evidence_exits_one(self) -> None:
+        for evidence_ids in (["DEC-001"], ["DEC-002", "DEC-006"]):
+            with self.subTest(evidence_ids=evidence_ids):
+                self.respond_with(
+                    {"id": "run", "status": "completed", "output": object_payload(evidence_ids=evidence_ids)}
+                )
+                with mock.patch("sys.stdout"):
+                    self.assertEqual(counterpoint_agent.main(["premature_auth_consensus"]), 1)
 
     def test_mismatched_decision_exits_one(self) -> None:
         self.respond_with(
@@ -1230,6 +1332,15 @@ class UnsafeTextTests(unittest.TestCase):
                     self.memory,
                 )
                 self.assertEqual(decision, _abstain("unsafe_text"))
+
+    def test_slack_user_group_mentions_are_suppressed_in_every_publishable_field(self) -> None:
+        for field in ("decision_summary", "objection", "resolution_question"):
+            for mention in ("<!subteam^S012AB3CD>", "<!subteam^S012AB3CD|@security-team>"):
+                with self.subTest(field=field, mention=mention):
+                    self.assertEqual(
+                        _validate_decision(object_payload(**{field: f"Ask {mention} to review?"}), self.memory),
+                        _abstain("unsafe_text"),
+                    )
 
     def test_links_are_suppressed(self) -> None:
         decision = _validate_decision(

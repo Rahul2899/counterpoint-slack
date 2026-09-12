@@ -162,6 +162,37 @@ class InterventionTests(unittest.TestCase):
                 runtime.drain()
                 self.assertEqual(self.client.posts, [])
 
+    def test_automatic_analysis_does_not_repeat_any_pending_summary(self):
+        runtime = self.runtime()
+        with patch("app.time.monotonic", side_effect=lambda: self.now):
+            self.feed(runtime)
+            runtime.drain()
+            runtime.analyzer = lambda messages: objection("Different decision")
+            runtime.request_manual()
+            runtime.drain()
+            self.assertEqual(len(self.client.posts), 2)
+            runtime.analyzer = lambda messages: objection("  LAUNCH   decision  ")
+            self.feed(runtime, 5, 1)
+            runtime.drain()
+            self.now = 100.0
+            FakeTimer.created[-1].fire()
+            runtime.drain()
+        self.assertEqual(len(self.client.posts), 2)
+        self.assertEqual(len(runtime.pending), 2)
+
+    def test_consecutive_manual_requests_do_not_repeat_pending_summary(self):
+        decisions = iter((objection(), objection("  LAUNCH   decision  "), objection("Different decision")))
+        runtime = self.runtime(lambda messages: next(decisions), start_worker=False)
+        for _ in range(3):
+            runtime.request_manual(lambda **payload: None)
+        runtime.start()
+        runtime.drain()
+        self.assertEqual(len(self.client.posts), 2)
+        self.assertEqual(
+            [decision["decision_summary"] for decision in runtime.pending.values()],
+            ["Launch decision", "Different decision"],
+        )
+
     def test_post_failure_or_missing_timestamp_leaves_no_pending_or_cooldown(self):
         for result in (RuntimeError("offline"), {"ok": True}, {"ok": True, "ts": ""}):
             with self.subTest(result=result):
@@ -510,6 +541,53 @@ class NormalizeMessageTests(unittest.TestCase):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_stopped_runtime_rejects_all_ingress_without_unfinished_work(self):
+        for start_worker in (True, False):
+            with self.subTest(start_worker=start_worker):
+                runtime = CounterpointRuntime(lambda messages: None, CHANNEL_ID, start_worker=start_worker)
+                self.addCleanup(runtime.stop)
+                runtime.stop()
+                self.assertFalse(runtime.handle_message(message_body("1")))
+                self.assertFalse(runtime.request_manual())
+                self.assertFalse(runtime.handle_reaction(reaction_body("101")))
+                runtime._wake_cooldown()
+                self.assertEqual(runtime.generation, 0)
+                self.assertEqual(runtime.work_queue.unfinished_tasks, 0)
+                self.assertTrue(runtime.work_queue.empty())
+
+    def test_shutdown_rejects_ingress_while_finishing_accepted_work(self):
+        entered, release, stop_enqueued = threading.Event(), threading.Event(), threading.Event()
+
+        def analyze(messages):
+            entered.set()
+            release.wait()
+
+        runtime = CounterpointRuntime(analyze, CHANNEL_ID)
+        self.addCleanup(runtime.stop)
+        self.addCleanup(release.set)
+        runtime.request_manual()
+        self.assertTrue(entered.wait(1))
+        original_put = runtime.work_queue.put
+
+        def observed_put(item):
+            original_put(item)
+            if item[0] == "stop":
+                stop_enqueued.set()
+
+        runtime.work_queue.put = observed_put
+        stopper = threading.Thread(target=runtime.stop)
+        stopper.start()
+        self.addCleanup(stopper.join, 2)
+        self.addCleanup(release.set)
+        self.assertTrue(stop_enqueued.wait(1))
+        self.assertFalse(runtime.handle_message(message_body("1")))
+        self.assertFalse(runtime.request_manual())
+        self.assertFalse(runtime.handle_reaction(reaction_body("101")))
+        release.set()
+        stopper.join(1)
+        self.assertFalse(stopper.is_alive())
+        self.assertEqual(runtime.work_queue.unfinished_tasks, 0)
+
     def test_deduplicates_outer_event_per_team_and_evicts_oldest_key(self):
         runtime = CounterpointRuntime(lambda messages: None, CHANNEL_ID, start_worker=False)
         first = message_body("1.0", event_id="Ev0")
@@ -676,27 +754,38 @@ class RuntimeTests(unittest.TestCase):
     def test_concurrent_submissions_keep_generation_and_enqueue_order_atomic(self):
         snapshots = []
         runtime = CounterpointRuntime(
-            lambda messages: snapshots.append(messages), CHANNEL_ID
+            lambda messages: snapshots.append(messages), CHANNEL_ID, start_worker=False
         )
         self.addCleanup(runtime.stop)
         for index, user_id in enumerate(("U1", "U2", "U1"), start=1):
             runtime.handle_message(message_body(f"{index}.0", user_id))
-        runtime.drain()
-
         first_put_entered = threading.Event()
         release_first_put = threading.Event()
-        second_finished = threading.Event()
+        second_waiting_for_lock = threading.Event()
+        enqueued = []
         original_put = runtime.work_queue.put
+
+        class ObservedLock:
+            def __init__(self):
+                self.lock = threading.Lock()
+
+            def __enter__(self):
+                if not self.lock.acquire(blocking=False):
+                    second_waiting_for_lock.set()
+                    self.lock.acquire()
+
+            def __exit__(self, *args):
+                self.lock.release()
+
+        runtime._ingress_lock = ObservedLock()
 
         def blocking_put(item):
             if item[0] == "message" and item[1]["ts"] == "4.0":
                 first_put_entered.set()
-                release_first_put.wait(2)
+                release_first_put.wait()
+            if item[0] == "message":
+                enqueued.append((item[1]["ts"], item[2]))
             original_put(item)
-
-        def submit_second():
-            runtime.handle_message(message_body("5.0", "U1"))
-            second_finished.set()
 
         runtime.work_queue.put = blocking_put
         self.addCleanup(release_first_put.set)
@@ -705,26 +794,30 @@ class RuntimeTests(unittest.TestCase):
             target=runtime.handle_message,
             args=(message_body("4.0", "U2"),),
         )
-        second = threading.Thread(target=submit_second)
+        second = threading.Thread(
+            target=runtime.handle_message,
+            args=(message_body("5.0", "U1"),),
+        )
         first.start()
         self.assertTrue(first_put_entered.wait(1), "first enqueue never paused")
         second.start()
-        second_finished_early = second_finished.wait(0.25)
+        self.assertTrue(second_waiting_for_lock.wait(1), "second submit did not contend for ingress lock")
+        self.assertEqual(enqueued, [])
         release_first_put.set()
         first.join(1)
         second.join(1)
-        runtime.drain()
-
-        self.assertFalse(second_finished_early, "second submit passed first generation")
         self.assertFalse(first.is_alive())
         self.assertFalse(second.is_alive())
-        # The backlogged run for "4.0" is skipped as already stale, so the one
-        # analyzed window is the coalesced newest one, still in timestamp order.
+        self.assertEqual(enqueued, [("4.0", 4), ("5.0", 5)])
+        # Start after both producers finish: generation 4 is now certainly stale.
+        runtime.start()
+        runtime.drain()
         self.assertEqual(len(snapshots), 1)
         self.assertEqual(
             [message["ts"] for message in snapshots[0]],
             ["1.0", "2.0", "3.0", "4.0", "5.0"],
         )
+        self.assertEqual(list(runtime.window), snapshots[0])
 
 
 class SlackHandlerTests(unittest.TestCase):
@@ -804,8 +897,8 @@ class StartupTests(unittest.TestCase):
         "EXA_API_KEY": "exa-test",
     }
 
-    def modules(self, *, handler_error=None):
-        calls = {"dotenv": 0, "handler": [], "handler_starts": 0}
+    def modules(self, *, handler_error=None, close_error=None):
+        calls = {"dotenv": 0, "handler": [], "handler_starts": 0, "shutdown": []}
         dotenv = types.ModuleType("dotenv")
 
         def load_dotenv():
@@ -840,6 +933,11 @@ class StartupTests(unittest.TestCase):
                 calls["handler_starts"] += 1
                 if handler_error is not None:
                     raise handler_error
+
+            def close(self):
+                calls["shutdown"].append("close")
+                if close_error is not None:
+                    raise close_error
 
         socket_mode.SocketModeHandler = FakeSocketModeHandler
         adapter.socket_mode = socket_mode
@@ -915,6 +1013,7 @@ class StartupTests(unittest.TestCase):
 
             def stop(self):
                 self.stopped += 1
+                calls["shutdown"].append("stop")
 
         with patch.dict(os.environ, self.required, clear=True), \
              patch.dict(sys.modules, modules), \
@@ -935,9 +1034,10 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(calls["handler_starts"], 1)
         self.assertEqual(runtime.started, 1)
         self.assertEqual(runtime.stopped, 1)
+        self.assertEqual(calls["shutdown"], ["close", "stop"])
 
     def test_socket_mode_failure_stops_worker_and_preserves_exception(self):
-        modules, _, _, _ = self.modules(handler_error=RuntimeError("socket failed"))
+        modules, calls, _, _ = self.modules(handler_error=RuntimeError("socket failed"))
         runtimes = []
 
         class Runtime:
@@ -953,6 +1053,7 @@ class StartupTests(unittest.TestCase):
 
             def stop(self):
                 self.stopped += 1
+                calls["shutdown"].append("stop")
 
         with patch.dict(os.environ, self.required, clear=True), \
              patch.dict(sys.modules, modules), \
@@ -962,6 +1063,33 @@ class StartupTests(unittest.TestCase):
 
         self.assertEqual(runtimes[0].started, 1)
         self.assertEqual(runtimes[0].stopped, 1)
+        self.assertEqual(calls["shutdown"], ["close", "stop"])
+
+    def test_close_failure_preserves_original_start_exception_and_stops_worker(self):
+        start_error = RuntimeError("socket failed")
+        modules, calls, _, _ = self.modules(handler_error=start_error, close_error=ValueError("close failed"))
+        with patch.dict(os.environ, self.required, clear=True), \
+             patch.dict(sys.modules, modules), \
+             patch.object(CounterpointRuntime, "stop", autospec=True, side_effect=CounterpointRuntime.stop) as stop:
+            with self.assertRaises(RuntimeError) as caught:
+                app.start_production()
+        self.assertIs(caught.exception, start_error)
+        runtime = stop.call_args.args[0]
+        self.assertFalse(runtime._worker.is_alive())
+        self.assertEqual(calls["shutdown"], ["close"])
+
+    def test_close_failure_after_success_still_stops_worker(self):
+        modules, _, _, _ = self.modules(close_error=ValueError("close failed"))
+        with patch.dict(os.environ, self.required, clear=True), \
+             patch.dict(sys.modules, modules), \
+             patch.object(CounterpointRuntime, "stop", autospec=True, side_effect=CounterpointRuntime.stop) as stop:
+            try:
+                raise RuntimeError("unrelated caller exception")
+            except RuntimeError:
+                with self.assertRaisesRegex(ValueError, "^close failed$"):
+                    app.start_production()
+        runtime = stop.call_args.args[0]
+        self.assertFalse(runtime._worker.is_alive())
 
 
 if __name__ == "__main__":

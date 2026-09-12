@@ -81,16 +81,22 @@ The first implementation uses Exa Agent API:
 - `POST https://api.exa.ai/agent/runs`
 - `GET https://api.exa.ai/agent/runs/{id}`
 - header `x-api-key: $EXA_API_KEY`
-- header `Exa-Beta: agent-2026-05-07`
 - `effort: minimal`
-- `budget.maxCostDollars: 0.05`
 - a strict `outputSchema`
 - 25-second application timeout
 
-Exa Agent is asynchronous and beta. Timeout, invalid output, provider failure,
+The fixed-price `minimal` effort does not accept `budget`; the documented
+`budget.maxCostDollars` field applies only to `auto` and `max` runs and starts
+at $1. The standard Agent endpoint no longer needs an `Exa-Beta` header.
+
+Exa Agent is asynchronous. Timeout, invalid output, provider failure,
 or stale conversation produces silence. The demo channel contains synthetic,
 non-sensitive information because supplied Slack text leaves the workspace and
 the API does not provide a documented hard switch disabling all web research.
+
+The Exa Search API is intentionally not in the live decision path. It is a
+web-retrieval API; Counterpoint already receives the complete bounded team
+memory and Slack window, so Search would add unrelated retrieval and latency.
 
 CopilotKit Intelligence is excluded from the core path. Its project key adds
 persistence and operational features but does not supply model inference.

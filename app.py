@@ -321,7 +321,13 @@ def create_slack_app(runtime: CounterpointRuntime, bot_token: str | None = None)
     """Register message, /dissent, and reaction_added listeners."""
     from slack_bolt import App
 
-    slack_app = App(token=bot_token or os.environ.get("SLACK_BOT_TOKEN"))
+    # Socket Mode receives events over a websocket, so there is no inbound HTTP
+    # request to verify. Leaving verification on would demand a signing secret
+    # that is never used, and Bolt refuses to start without one.
+    slack_app = App(
+        token=bot_token or os.environ.get("SLACK_BOT_TOKEN"),
+        request_verification_enabled=False,
+    )
     if runtime.slack_client is None:
         runtime.slack_client = slack_app.client
 

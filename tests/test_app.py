@@ -34,8 +34,9 @@ def message_body(
 
 
 class FakeBoltApp:
-    def __init__(self, token: str | None = None):
+    def __init__(self, token: str | None = None, **options):
         self.token = token
+        self.options = options
         self.events = {}
         self.commands = {}
         self.client = FakeSlack()
@@ -822,8 +823,8 @@ class StartupTests(unittest.TestCase):
                 return {"user_id": "UBOT"}
 
         class ProductionBoltApp(FakeBoltApp):
-            def __init__(self, token):
-                super().__init__(token)
+            def __init__(self, token, **options):
+                super().__init__(token, **options)
                 self.client = ProductionSlack()
                 apps.append(self)
 

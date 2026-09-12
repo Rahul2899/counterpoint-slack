@@ -7,9 +7,11 @@ frozen contract between Plan A and Plan B drifts.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
 import sys
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -21,6 +23,8 @@ if str(REPO_ROOT) not in sys.path:
 import app  # noqa: E402
 import counterpoint_agent  # noqa: E402
 from app import CounterpointRuntime  # noqa: E402
+
+HAS_SLACK_BOLT = importlib.util.find_spec("slack_bolt") is not None
 
 CHANNEL_ID = "C0123456789"
 BOT_USER_ID = "U0BOT"
@@ -436,6 +440,53 @@ class ContractDriftTests(unittest.TestCase):
         source = (REPO_ROOT / "counterpoint_agent.py").read_text(encoding="utf-8")
         for token in ("chat_postMessage", "chat_update", "SocketMode", "slack.com"):
             self.assertNotIn(token, source, token)
+
+
+class SocketModeStartupTests(unittest.TestCase):
+    """The runtime must be constructible without a signing secret."""
+
+    def test_create_slack_app_disables_request_verification(self) -> None:
+        captured: dict[str, object] = {}
+
+        class StubApp:
+            def __init__(self, **options):
+                captured.update(options)
+                self.client = object()
+
+            def event(self, name):
+                return lambda handler: handler
+
+            def command(self, name):
+                return lambda handler: handler
+
+        module = types.ModuleType("slack_bolt")
+        module.App = StubApp
+        runtime = CounterpointRuntime(
+            analyzer=lambda messages: None,
+            channel_id=CHANNEL_ID,
+            start_worker=False,
+        )
+        with mock.patch.dict(sys.modules, {"slack_bolt": module}):
+            app.create_slack_app(runtime, "xoxb-not-real")
+        self.assertIs(captured["request_verification_enabled"], False)
+
+    @unittest.skipUnless(HAS_SLACK_BOLT, "slack_bolt is not installed")
+    def test_bolt_refuses_to_start_without_the_flag(self) -> None:
+        """Why the flag exists: Socket Mode has no signing secret to give."""
+        from slack_bolt import App
+
+        with self.assertRaises(ValueError):
+            App(
+                token="xoxb-not-real",
+                signing_secret="",
+                token_verification_enabled=False,
+            )
+        App(
+            token="xoxb-not-real",
+            signing_secret="",
+            token_verification_enabled=False,
+            request_verification_enabled=False,
+        )
 
 
 if __name__ == "__main__":

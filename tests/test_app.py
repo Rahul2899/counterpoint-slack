@@ -37,6 +37,7 @@ class FakeBoltApp:
         self.token = token
         self.events = {}
         self.commands = {}
+        self.client = FakeSlack()
 
     def event(self, name):
         def register(handler):
@@ -51,6 +52,398 @@ class FakeBoltApp:
             return handler
 
         return register
+
+
+def objection(summary="Launch decision"):
+    return {
+        "action": "object", "confidence": 0.9, "decision_summary": summary,
+        "objection": "The rollout lacks a rollback test.",
+        "evidence_ids": ["MEM-1"],
+        "resolution_question": "Can we test rollback first?", "reason": "Evidence conflicts.",
+    }
+
+
+def reaction_body(ts, user="U9", **changes):
+    event = {
+        "type": "reaction_added", "reaction": "-1", "user": user,
+        "item": {"type": "message", "channel": CHANNEL_ID, "ts": ts},
+    }
+    event.update(changes)
+    return {"event": event}
+
+
+class FakeSlack:
+    def __init__(self):
+        self.posts = []
+        self.updates = []
+        self.post_results = []
+        self.update_results = []
+
+    def chat_postMessage(self, **payload):
+        self.posts.append(payload)
+        result = self.post_results.pop(0) if self.post_results else {"ok": True, "ts": str(100 + len(self.posts))}
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def chat_update(self, **payload):
+        self.updates.append(payload)
+        result = self.update_results.pop(0) if self.update_results else {"ok": True, "ts": payload["ts"]}
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+class FakeTimer:
+    created = []
+
+    def __init__(self, interval, callback):
+        self.interval = interval
+        self.callback = callback
+        self.cancelled = False
+        self.created.append(self)
+
+    def start(self):
+        pass
+
+    def cancel(self):
+        self.cancelled = True
+
+    def fire(self):
+        if not self.cancelled:
+            self.callback()
+
+
+class InterventionTests(unittest.TestCase):
+    def setUp(self):
+        self.client = FakeSlack()
+        self.now = 10.0
+        FakeTimer.created = []
+        self.timer_patch = patch("app.threading.Timer", FakeTimer)
+        self.timer_patch.start()
+        self.addCleanup(self.timer_patch.stop)
+
+    def runtime(self, analyzer=None, **kwargs):
+        runtime = CounterpointRuntime(analyzer or (lambda messages: objection()), CHANNEL_ID, **kwargs)
+        runtime.slack_client = self.client
+        self.addCleanup(runtime.stop)
+        return runtime
+
+    def feed(self, runtime, start=1, count=4):
+        for index in range(start, start + count):
+            runtime.handle_message(message_body(str(index), "U1" if index % 2 else "U2"))
+
+    def test_object_posts_once_with_fallback_and_blocks(self):
+        runtime = self.runtime(start_worker=False)
+        self.feed(runtime)
+        runtime.start()
+        runtime.drain()
+        self.assertEqual(len(self.client.posts), 1)
+        post = self.client.posts[0]
+        self.assertEqual(post["channel"], CHANNEL_ID)
+        for text in ("Counterpoint", "The rollout lacks a rollback test.", "MEM-1", "Can we test rollback first?", "React :thumbsdown: to dismiss and record."):
+            self.assertIn(text, post["text"])
+            self.assertIn(text, str(post["blocks"]))
+        self.assertNotIn("button", str(post["blocks"]))
+        self.assertEqual(list(runtime.pending), ["101"])
+
+    def test_abstain_and_malformed_objects_are_silent(self):
+        cases = [{"action": "abstain"}, None, objection() | {"action": "other"}]
+        for field in ("decision_summary", "objection", "resolution_question"):
+            cases.append(objection() | {field: " "})
+        for ids in ([], [""], ["a", "b", "c"], "MEM-1", [1]):
+            cases.append(objection() | {"evidence_ids": ids})
+        for decision in cases:
+            with self.subTest(decision=decision):
+                runtime = self.runtime(lambda messages: decision)
+                self.feed(runtime)
+                runtime.drain()
+                self.assertEqual(self.client.posts, [])
+
+    def test_post_failure_or_missing_timestamp_leaves_no_pending_or_cooldown(self):
+        for result in (RuntimeError("offline"), {"ok": True}, {"ok": True, "ts": ""}):
+            with self.subTest(result=result):
+                self.client = FakeSlack()
+                self.client.post_results = [result]
+                runtime = self.runtime()
+                self.feed(runtime)
+                runtime.drain()
+                self.assertEqual(runtime.pending, {})
+                self.assertEqual(runtime.cooldown_until, 0)
+                self.feed(runtime, 5, 1)
+                runtime.drain()
+                self.assertEqual(len(runtime.pending), 1)
+                self.assertGreater(runtime.cooldown_until, 0)
+
+    def test_stale_result_is_discarded_and_backlog_coalesces_to_newest(self):
+        entered, release = threading.Event(), threading.Event()
+        snapshots = []
+
+        def analyze(messages):
+            snapshots.append(messages)
+            if len(snapshots) == 1:
+                entered.set()
+                release.wait(2)
+            return objection()
+
+        runtime = self.runtime(analyze)
+        self.addCleanup(release.set)
+        self.feed(runtime)
+        self.assertTrue(entered.wait(1))
+        self.feed(runtime, 5, 4)
+        release.set()
+        runtime.drain()
+        self.assertEqual([len(items) for items in snapshots], [4, 8])
+        self.assertEqual(len(self.client.posts), 1)
+
+    def test_generation_rechecked_after_render_immediately_before_publication(self):
+        runtime = self.runtime(start_worker=False)
+        render = runtime._render_intervention
+        rendered = []
+
+        def render_and_accept_message(decision):
+            payload = render(decision)
+            rendered.append(payload)
+            if len(rendered) == 1:
+                self.feed(runtime, 5, 1)
+            return payload
+
+        runtime._render_intervention = render_and_accept_message
+        self.feed(runtime)
+        runtime.start()
+        runtime.drain()
+        self.assertEqual(len(rendered), 2)
+        self.assertEqual(len(self.client.posts), 1)
+
+    def test_messages_accepted_during_slack_request_dirty_the_next_window(self):
+        entered, release = threading.Event(), threading.Event()
+        post = self.client.chat_postMessage
+        snapshots = []
+
+        def blocked_post(**payload):
+            entered.set()
+            release.wait(2)
+            return post(**payload)
+
+        self.client.chat_postMessage = blocked_post
+        runtime = self.runtime(lambda messages: snapshots.append(messages) or objection())
+        self.addCleanup(release.set)
+        self.feed(runtime)
+        self.assertTrue(entered.wait(1))
+        self.feed(runtime, 5, 2)
+        release.set()
+        runtime.drain()
+        self.assertEqual(len(self.client.posts), 1)
+        self.assertEqual(len(runtime.window), 6)
+        self.assertEqual(len(runtime.pending), 1)
+        self.assertEqual(len(snapshots), 1)
+
+    def test_cooldown_updates_window_then_evaluates_once_and_manual_bypasses(self):
+        snapshots = []
+        runtime = self.runtime(lambda messages: snapshots.append(messages) or objection())
+        with patch("app.time.monotonic", side_effect=lambda: self.now):
+            self.feed(runtime)
+            runtime.drain()
+            self.assertEqual(runtime.cooldown_until, 100.0)
+            self.feed(runtime, 5, 3)
+            runtime.drain()
+            self.assertEqual(len(snapshots), 1)
+            self.assertEqual(len(runtime.window), 7)
+            self.now = 100.0
+            FakeTimer.created[-1].fire()
+            runtime.drain()
+            self.assertEqual(len(snapshots), 2)
+            FakeTimer.created[-1].fire()
+            runtime.drain()
+            self.assertEqual(len(snapshots), 2)
+            runtime.request_manual()
+            runtime.drain()
+            self.assertEqual(len(snapshots), 3)
+
+    def test_manual_requests_keep_each_responder_and_bypass_activity_gate(self):
+        responses = [[], []]
+        calls = []
+        runtime = self.runtime(lambda messages: calls.append(messages) or {"action": "abstain"}, start_worker=False)
+        for result in responses:
+            runtime.request_manual(lambda result=result, **payload: result.append(payload))
+        runtime.start()
+        runtime.drain()
+        self.assertEqual(calls, [[], []])
+        for result in responses:
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0]["response_type"], "ephemeral")
+        self.assertEqual(self.client.posts, [])
+
+    def test_manual_abstention_during_cooldown_keeps_newest_window_evaluation(self):
+        snapshots = []
+        runtime = self.runtime(lambda messages: snapshots.append(messages) or objection())
+        responses = []
+        with patch("app.time.monotonic", side_effect=lambda: self.now):
+            self.feed(runtime)
+            runtime.drain()
+            self.feed(runtime, 5, 1)
+            runtime.drain()
+            runtime.analyzer = lambda messages: snapshots.append(messages) or {"action": "abstain"}
+            runtime.request_manual(lambda **payload: responses.append(payload))
+            runtime.drain()
+            self.assertEqual(len(responses), 1)
+            self.now = 100.0
+            FakeTimer.created[-1].fire()
+            runtime.drain()
+            self.assertEqual([len(messages) for messages in snapshots], [4, 5, 5])
+
+    def test_dismissal_rejects_invalid_reactions_and_records_once(self):
+        runtime = self.runtime(bot_user_id="UBOT")
+        self.feed(runtime)
+        runtime.drain()
+        for body in (
+            {}, reaction_body("101", reaction="thumbsdown"), reaction_body("101", user=""),
+            reaction_body("101", user="UBOT"), reaction_body("101", item={"type": "file", "channel": CHANNEL_ID, "ts": "101"}),
+            reaction_body("101", item={"type": "message", "channel": "COTHER", "ts": "101"}), reaction_body("unknown"),
+        ):
+            runtime.handle_reaction(body)
+        runtime.drain()
+        self.assertEqual(list(runtime.pending), ["101"])
+        self.assertEqual(len(self.client.posts), 1)
+        runtime.handle_reaction(reaction_body("101"))
+        runtime.handle_reaction(reaction_body("101"))
+        runtime.drain()
+        self.assertEqual(runtime.pending, {})
+        self.assertEqual(len(runtime.ledger_rows), 1)
+        ledger = next(post for post in self.client.posts if "Decision dissent ledger" in post["text"])
+        for text in ("101", "Launch decision", "MEM-1", "<@U9>", "dismissed"):
+            self.assertIn(text, ledger["text"])
+        replies = [post for post in self.client.posts if post.get("thread_ts") == "101"]
+        self.assertEqual([post["text"] for post in replies], ["Understood. Standing down. Logged."])
+        runtime.handle_reaction(reaction_body(runtime.ledger_ts))
+        runtime.drain()
+        self.assertEqual(len(runtime.ledger_rows), 1)
+        runtime.analyzer = lambda messages: objection("  LAUNCH   decision  ")
+        runtime.request_manual()
+        runtime.drain()
+        self.assertEqual(len(self.client.posts), 3)
+
+    def test_reaction_queued_during_post_is_applied_after_pending_exists(self):
+        entered, release = threading.Event(), threading.Event()
+        original_post = self.client.chat_postMessage
+
+        def blocked_post(**payload):
+            if len(self.client.posts) == 0:
+                entered.set()
+                release.wait(2)
+            return original_post(**payload)
+
+        self.client.chat_postMessage = blocked_post
+        runtime = self.runtime()
+        self.addCleanup(release.set)
+        self.feed(runtime)
+        self.assertTrue(entered.wait(1))
+        self.assertTrue(runtime.handle_reaction(reaction_body("101")))
+        self.assertEqual(runtime.pending, {})
+        release.set()
+        runtime.drain()
+        self.assertEqual(runtime.pending, {})
+        self.assertEqual(len(runtime.ledger_rows), 1)
+
+    def dismiss_next(self, runtime, summary):
+        runtime.analyzer = lambda messages: objection(summary)
+        runtime.request_manual()
+        runtime.drain()
+        ts = next(iter(runtime.pending))
+        runtime.handle_reaction(reaction_body(ts))
+        runtime.drain()
+        return ts
+
+    def test_ledger_create_update_and_message_not_found_replacement(self):
+        runtime = self.runtime()
+        self.dismiss_next(runtime, "First")
+        first_ts = runtime.ledger_ts
+        self.dismiss_next(runtime, "Second")
+        self.assertEqual(runtime.ledger_ts, first_ts)
+        self.assertEqual(len(self.client.updates), 1)
+        self.client.update_results = [{"ok": False, "error": "message_not_found"}]
+        self.dismiss_next(runtime, "Third")
+        self.assertNotEqual(runtime.ledger_ts, first_ts)
+        self.assertEqual(len(runtime.ledger_rows), 3)
+        self.assertIn("First", self.client.posts[-1]["text"])
+        self.assertIn("Third", self.client.posts[-1]["text"])
+        self.assertFalse(runtime.ledger_dirty)
+
+    def test_ledger_replaces_message_not_found_slack_exception(self):
+        runtime = self.runtime()
+        self.dismiss_next(runtime, "First")
+        old_ts = runtime.ledger_ts
+        error = RuntimeError("Slack message_not_found")
+        error.response = {"ok": False, "error": "message_not_found"}
+        self.client.update_results = [error]
+        self.dismiss_next(runtime, "Second")
+        self.assertNotEqual(runtime.ledger_ts, old_ts)
+        self.assertFalse(runtime.ledger_dirty)
+
+    def test_empty_ledger_create_timestamp_keeps_dirty_state_for_retry(self):
+        runtime = self.runtime()
+        runtime.request_manual()
+        runtime.drain()
+        self.client.post_results = [{"ok": True, "ts": "reply"}, {"ok": True, "ts": ""}]
+        runtime.handle_reaction(reaction_body("101"))
+        runtime.drain()
+        self.assertIsNone(runtime.ledger_ts)
+        self.assertTrue(runtime.ledger_dirty)
+        runtime.handle_reaction(reaction_body("101"))
+        runtime.drain()
+        self.assertIsNotNone(runtime.ledger_ts)
+        self.assertEqual(len(runtime.ledger_rows), 1)
+        self.assertFalse(runtime.ledger_dirty)
+
+    def test_invalid_ledger_update_timestamp_keeps_dirty_state_for_retry(self):
+        for timestamp in (None, "", " ", 123):
+            with self.subTest(timestamp=timestamp):
+                self.client = FakeSlack()
+                runtime = self.runtime()
+                self.dismiss_next(runtime, "First")
+                old_ts = runtime.ledger_ts
+                self.client.update_results = [{"ok": True, "ts": timestamp}]
+                second_ts = self.dismiss_next(runtime, "Second")
+                self.assertTrue(runtime.ledger_dirty)
+                self.assertEqual(runtime.ledger_ts, old_ts)
+                runtime.handle_reaction(reaction_body(second_ts))
+                runtime.drain()
+                self.assertFalse(runtime.ledger_dirty)
+                self.assertEqual(len(runtime.ledger_rows), 2)
+
+    def test_ledger_failures_retain_rows_and_retry_complete_ledger(self):
+        for failure in ("create", "update", "replacement"):
+            with self.subTest(failure=failure):
+                self.client = FakeSlack()
+                runtime = self.runtime()
+                if failure != "create":
+                    self.dismiss_next(runtime, "First")
+                old_ts = runtime.ledger_ts
+                runtime.analyzer = lambda messages: objection("Retry decision")
+                runtime.request_manual()
+                runtime.drain()
+                intervention_ts = next(iter(runtime.pending))
+                if failure == "update":
+                    self.client.update_results = [RuntimeError("offline")]
+                else:
+                    if failure == "replacement":
+                        self.client.update_results = [{"ok": False, "error": "message_not_found"}]
+                    self.client.post_results = [{"ok": True, "ts": "reply"}, RuntimeError("offline")]
+                runtime.handle_reaction(reaction_body(intervention_ts))
+                runtime.drain()
+                self.assertTrue(runtime.ledger_dirty)
+                self.assertEqual(runtime.ledger_ts, old_ts)
+                rows = dict(runtime.ledger_rows)
+                if failure == "replacement":
+                    self.client.update_results = [{"ok": False, "error": "message_not_found"}]
+                runtime.handle_reaction(reaction_body(intervention_ts))
+                runtime.drain()
+                self.assertFalse(runtime.ledger_dirty)
+                self.assertEqual(runtime.ledger_rows, rows)
+                rendered = (self.client.updates[-1] if failure == "update" else self.client.posts[-1])["text"]
+                self.assertIn("Retry decision", rendered)
+                if failure != "create":
+                    self.assertIn("First", rendered)
 
 
 class NormalizeMessageTests(unittest.TestCase):
@@ -338,6 +731,35 @@ class SlackHandlerTests(unittest.TestCase):
         self.assertEqual(calls[0], "ack")
         self.assertEqual(calls[1]["response_type"], "ephemeral")
         self.assertEqual(runtime.work_queue.qsize(), 0)
+
+    def test_handlers_retain_manual_responder_and_wire_reaction_to_worker(self):
+        runtime = CounterpointRuntime(lambda messages: {"action": "abstain"}, CHANNEL_ID)
+        self.addCleanup(runtime.stop)
+        slack_app = self.make_app(runtime)
+        responses = []
+        slack_app.commands["/dissent"](
+            ack=lambda: None, body={"channel_id": CHANNEL_ID},
+            respond=lambda **payload: responses.append(payload),
+        )
+        runtime.drain()
+        self.assertEqual(responses[0]["response_type"], "ephemeral")
+        runtime.analyzer = lambda messages: objection()
+        runtime.request_manual()
+        runtime.drain()
+        self.assertEqual(len(slack_app.client.posts), 1)
+        slack_app.events["reaction_added"](reaction_body("101"))
+        runtime.drain()
+        self.assertEqual(len(runtime.ledger_rows), 1)
+
+    def test_app_preserves_explicit_runtime_slack_client(self):
+        client = FakeSlack()
+        runtime = CounterpointRuntime(lambda messages: objection(), CHANNEL_ID, slack_client=client)
+        self.addCleanup(runtime.stop)
+        slack_app = self.make_app(runtime)
+        runtime.request_manual()
+        runtime.drain()
+        self.assertEqual(len(client.posts), 1)
+        self.assertEqual(slack_app.client.posts, [])
 
 
 if __name__ == "__main__":

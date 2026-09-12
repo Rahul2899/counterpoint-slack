@@ -1,6 +1,7 @@
 import os
 import queue
 import threading
+import time
 from collections import deque
 from decimal import Decimal
 from typing import Callable
@@ -44,10 +45,16 @@ class CounterpointRuntime:
         channel_id: str,
         *,
         start_worker: bool = True,
+        slack_client=None,
+        bot_user_id: str | None = None,
+        cooldown_seconds: int = 90,
     ) -> None:
         self.analyzer = analyzer
         self.channel_id = channel_id
-        self.work_queue: queue.Queue[tuple[str, NormalizedMessage | None, int]] = (
+        self.slack_client = slack_client
+        self.bot_user_id = bot_user_id
+        self.cooldown_seconds = cooldown_seconds
+        self.work_queue: queue.Queue[tuple[str, object, int]] = (
             queue.Queue()
         )
         self.window: deque[NormalizedMessage] = deque(maxlen=15)
@@ -57,6 +64,13 @@ class CounterpointRuntime:
         self._ingress_lock = threading.Lock()
         self._worker: threading.Thread | None = None
         self._stopped = False
+        self.pending: dict[str, dict] = {}
+        self.suppressed_summaries: set[str] = set()
+        self.ledger_rows: dict[str, dict] = {}
+        self.ledger_dirty = False
+        self.ledger_ts: str | None = None
+        self.cooldown_until = 0.0
+        self._cooldown_timer: threading.Timer | None = None
         if start_worker:
             self.start()
 
@@ -113,33 +127,180 @@ class CounterpointRuntime:
 
         return True
 
-    def request_manual(self) -> None:
+    def request_manual(self, respond=None) -> None:
         with self._ingress_lock:
-            self.work_queue.put(("manual", None, self._generation))
+            self.work_queue.put(("manual", respond, self._generation))
+
+    def handle_reaction(self, body: dict[str, object]) -> bool:
+        event = body.get("event")
+        if not isinstance(event, dict) or event.get("type") != "reaction_added":
+            return False
+        item = event.get("item")
+        user = event.get("user")
+        if (
+            event.get("reaction") != "-1"
+            or not isinstance(item, dict)
+            or item.get("type") != "message"
+            or item.get("channel") != self.channel_id
+            or not isinstance(item.get("ts"), str)
+            or not item["ts"]
+            or not isinstance(user, str)
+            or not user.strip()
+            or user == self.bot_user_id
+            or event.get("bot_id") is not None
+        ):
+            return False
+        with self._ingress_lock:
+            self.work_queue.put(("reaction", {"ts": item["ts"], "user": user}, self._generation))
+        return True
+
+    def _wake_cooldown(self) -> None:
+        with self._ingress_lock:
+            if not self._stopped:
+                self.work_queue.put(("cooldown", None, self._generation))
+
+    @staticmethod
+    def _summary_key(summary: str) -> str:
+        return " ".join(summary.casefold().split())
+
+    @staticmethod
+    def _render_intervention(decision: dict) -> dict:
+        parts = [
+            "Counterpoint", decision["objection"],
+            "Evidence: " + ", ".join(decision["evidence_ids"]),
+            decision["resolution_question"],
+            "React :thumbsdown: to dismiss and record.",
+        ]
+        return {
+            "text": "\n\n".join(parts),
+            "blocks": [
+                {"type": "header", "text": {"type": "plain_text", "text": parts[0]}},
+                *[{"type": "section", "text": {"type": "plain_text", "text": part}} for part in parts[1:-1]],
+                {"type": "context", "elements": [{"type": "plain_text", "text": parts[-1]}]},
+            ],
+        }
+
+    def _analyze(self, generation: int, respond=None) -> None:
+        try:
+            decision = self.analyzer(list(self.window))
+            valid = (
+                isinstance(decision, dict)
+                and decision.get("action") == "object"
+                and all(isinstance(decision.get(field), str) and decision[field].strip()
+                        for field in ("decision_summary", "objection", "resolution_question"))
+                and isinstance(decision.get("evidence_ids"), list)
+                and 1 <= len(decision["evidence_ids"]) <= 2
+                and all(isinstance(value, str) and value.strip() for value in decision["evidence_ids"])
+            )
+            if not valid or self._summary_key(decision["decision_summary"]) in self.suppressed_summaries:
+                if respond is not None:
+                    respond(text="No evidence-backed objection to raise.", response_type="ephemeral")
+                return
+            payload = self._render_intervention(decision)
+            with self._ingress_lock:
+                if generation != self._generation:
+                    return
+            # The lock check is the publication boundary; ingress stays live during HTTP.
+            # An HTTP timeout can leave an accepted but untracked Slack message.
+            response = self.slack_client.chat_postMessage(channel=self.channel_id, **payload)
+            timestamp = response.get("ts")
+            if response.get("ok", True) is False or not isinstance(timestamp, str) or not timestamp.strip():
+                return
+            self.pending[timestamp] = dict(decision)
+            self.cooldown_until = time.monotonic() + self.cooldown_seconds
+            if self._cooldown_timer is not None:
+                self._cooldown_timer.cancel()
+            self._cooldown_timer = threading.Timer(self.cooldown_seconds, self._wake_cooldown)
+            self._cooldown_timer.daemon = True
+            self._cooldown_timer.start()
+        except Exception:
+            # Provider/Slack failures intentionally do not create an intervention.
+            pass
+
+    def _dismiss(self, reaction: dict) -> None:
+        timestamp = reaction["ts"]
+        decision = self.pending.pop(timestamp, None)
+        if decision is None:
+            return
+        self.ledger_rows[timestamp] = {**decision, "dismissed_by": reaction["user"]}
+        self.suppressed_summaries.add(self._summary_key(decision["decision_summary"]))
+        self.ledger_dirty = True
+        try:
+            self.slack_client.chat_postMessage(
+                channel=self.channel_id, thread_ts=timestamp,
+                text="Understood. Standing down. Logged.",
+            )
+        except Exception:
+            pass
+
+    def _sync_ledger(self) -> None:
+        if not self.ledger_dirty:
+            return
+        text = "Decision dissent ledger\n\n" + "\n\n".join(
+            f"{timestamp} | {row['decision_summary']} | Evidence: {', '.join(row['evidence_ids'])}"
+            f" | <@{row['dismissed_by']}> | dismissed"
+            for timestamp, row in self.ledger_rows.items()
+        )
+        try:
+            if self.ledger_ts is not None:
+                try:
+                    response = self.slack_client.chat_update(channel=self.channel_id, ts=self.ledger_ts, text=text)
+                except Exception as error:
+                    response = getattr(error, "response", {})
+                    if response.get("error") != "message_not_found":
+                        return
+                if response.get("error") != "message_not_found":
+                    timestamp = response.get("ts")
+                    if response.get("ok", True) and isinstance(timestamp, str) and timestamp.strip():
+                        self.ledger_dirty = False
+                    return
+            response = self.slack_client.chat_postMessage(channel=self.channel_id, text=text)
+            timestamp = response.get("ts")
+            if response.get("ok", True) and isinstance(timestamp, str) and timestamp.strip():
+                self.ledger_ts = timestamp
+                self.ledger_dirty = False
+        except Exception:
+            # Local rows remain authoritative until a later queue item retries them.
+            pass
 
     def _run(self) -> None:
+        window_generation = 0
+        automatic_dirty = False
+        analyzed = False
         while True:
-            kind, message, _generation = self.work_queue.get()
+            kind, message, generation = self.work_queue.get()
             try:
                 if kind == "stop":
+                    if self._cooldown_timer is not None:
+                        self._cooldown_timer.cancel()
                     return
 
-                should_analyze = kind == "manual"
                 if kind == "message":
                     messages = [*self.window, message]
                     messages.sort(key=lambda item: Decimal(item["ts"]))
                     self.window.clear()
                     self.window.extend(messages[-15:])
-                    should_analyze = len(self.window) >= 4 and len(
-                        {item["user_id"] for item in self.window}
-                    ) >= 2
+                    window_generation = generation
+                    automatic_dirty = True
+                elif kind == "reaction":
+                    self._dismiss(message)
 
-                if should_analyze:
-                    try:
-                        self.analyzer(list(self.window))
-                    except Exception:
-                        # Provider failures intentionally produce silence.
-                        pass
+                self._sync_ledger()
+                if kind == "manual":
+                    if time.monotonic() >= self.cooldown_until:
+                        automatic_dirty = False
+                    self._analyze(window_generation, message)
+                    analyzed = True
+                elif (
+                    automatic_dirty
+                    and (not analyzed or self.work_queue.empty())
+                    and time.monotonic() >= self.cooldown_until
+                    and len(self.window) >= 4
+                    and len({item["user_id"] for item in self.window}) >= 2
+                ):
+                    automatic_dirty = False
+                    self._analyze(window_generation)
+                    analyzed = True
             finally:
                 self.work_queue.task_done()
 
@@ -149,6 +310,8 @@ def create_slack_app(runtime: CounterpointRuntime):
     from slack_bolt import App
 
     slack_app = App(token=os.environ.get("SLACK_BOT_TOKEN"))
+    if runtime.slack_client is None:
+        runtime.slack_client = slack_app.client
 
     @slack_app.event("message")
     def handle_message(body):
@@ -163,10 +326,10 @@ def create_slack_app(runtime: CounterpointRuntime):
                 response_type="ephemeral",
             )
             return
-        runtime.request_manual()
+        runtime.request_manual(respond)
 
     @slack_app.event("reaction_added")
     def handle_reaction_added(body):
-        return None
+        return runtime.handle_reaction(body)
 
     return slack_app

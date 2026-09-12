@@ -54,7 +54,7 @@ class CounterpointRuntime:
         self._seen_event_order: deque[str] = deque(maxlen=500)
         self._seen_event_keys: set[str] = set()
         self._generation = 0
-        self._generation_lock = threading.Lock()
+        self._ingress_lock = threading.Lock()
         self._worker: threading.Thread | None = None
         self._stopped = False
         if start_worker:
@@ -62,7 +62,7 @@ class CounterpointRuntime:
 
     @property
     def generation(self) -> int:
-        with self._generation_lock:
+        with self._ingress_lock:
             return self._generation
 
     def start(self) -> None:
@@ -76,7 +76,8 @@ class CounterpointRuntime:
         if worker is None or self._stopped:
             return
         self._stopped = True
-        self.work_queue.put(("stop", None, self.generation))
+        with self._ingress_lock:
+            self.work_queue.put(("stop", None, self._generation))
         worker.join()
 
     def drain(self) -> None:
@@ -97,7 +98,7 @@ class CounterpointRuntime:
             and event_id
             else None
         )
-        with self._generation_lock:
+        with self._ingress_lock:
             if event_key is not None and event_key in self._seen_event_keys:
                 return False
             if event_key is not None:
@@ -108,52 +109,39 @@ class CounterpointRuntime:
                 self._seen_event_keys.add(event_key)
             self._generation += 1
             generation = self._generation
+            self.work_queue.put(("message", message, generation))
 
-        self.work_queue.put(("message", message, generation))
         return True
 
     def request_manual(self) -> None:
-        self.work_queue.put(("manual", None, self.generation))
+        with self._ingress_lock:
+            self.work_queue.put(("manual", None, self._generation))
 
     def _run(self) -> None:
         while True:
-            first = self.work_queue.get()
-            items = [first]
-            while True:
-                try:
-                    items.append(self.work_queue.get_nowait())
-                except queue.Empty:
-                    break
+            kind, message, _generation = self.work_queue.get()
+            try:
+                if kind == "stop":
+                    return
 
-            items.sort(key=self._work_sort_key)
-            should_stop = False
-            for kind, message, _generation in items:
-                try:
-                    if kind == "stop":
-                        should_stop = True
-                    elif kind == "message":
-                        self.window.append(message)
-                        if len(self.window) >= 4 and len(
-                            {item["user_id"] for item in self.window}
-                        ) >= 2:
-                            self.analyzer(list(self.window))
-                    elif kind == "manual":
+                should_analyze = kind == "manual"
+                if kind == "message":
+                    messages = [*self.window, message]
+                    messages.sort(key=lambda item: Decimal(item["ts"]))
+                    self.window.clear()
+                    self.window.extend(messages[-15:])
+                    should_analyze = len(self.window) >= 4 and len(
+                        {item["user_id"] for item in self.window}
+                    ) >= 2
+
+                if should_analyze:
+                    try:
                         self.analyzer(list(self.window))
-                finally:
-                    self.work_queue.task_done()
-            if should_stop:
-                return
-
-    @staticmethod
-    def _work_sort_key(
-        item: tuple[str, NormalizedMessage | None, int]
-    ) -> tuple[int, Decimal]:
-        kind, message, _generation = item
-        if kind == "message":
-            return (0, Decimal(message["ts"]))
-        if kind == "manual":
-            return (1, Decimal(0))
-        return (2, Decimal(0))
+                    except Exception:
+                        # Provider failures intentionally produce silence.
+                        pass
+            finally:
+                self.work_queue.task_done()
 
 
 def create_slack_app(runtime: CounterpointRuntime):

@@ -152,6 +152,26 @@ class RuntimeTests(unittest.TestCase):
             ["1.0", "2.0", "3.0", "4.0"],
         )
 
+    def test_running_worker_reorders_late_messages_by_numeric_timestamp(self):
+        calls = []
+        runtime = CounterpointRuntime(
+            lambda messages: calls.append(messages), CHANNEL_ID
+        )
+        self.addCleanup(runtime.stop)
+        for ts, user_id in (
+            ("3.0", "U1"),
+            ("1.0", "U2"),
+            ("10.0", "U1"),
+            ("2.0", "U2"),
+        ):
+            runtime.handle_message(message_body(ts, user_id))
+            runtime.drain()
+
+        self.assertEqual(
+            [message["ts"] for message in calls[0]],
+            ["1.0", "2.0", "3.0", "10.0"],
+        )
+
     def test_window_keeps_only_latest_fifteen_messages(self):
         runtime = CounterpointRuntime(lambda messages: None, CHANNEL_ID, start_worker=False)
         self.addCleanup(runtime.stop)
@@ -185,6 +205,99 @@ class RuntimeTests(unittest.TestCase):
         runtime.drain()
         self.assertEqual(len(calls), 1)
         self.assertEqual(len(calls[0]), 5)
+
+    def test_three_messages_from_two_users_do_not_trigger_analysis(self):
+        calls = []
+        runtime = CounterpointRuntime(
+            lambda messages: calls.append(messages), CHANNEL_ID
+        )
+        self.addCleanup(runtime.stop)
+        for index, user_id in enumerate(("U1", "U2", "U1"), start=1):
+            runtime.handle_message(message_body(f"{index}.0", user_id))
+
+        runtime.drain()
+
+        self.assertEqual(calls, [])
+
+    def test_analyzer_exception_does_not_kill_worker_or_block_drain(self):
+        attempts = []
+        successful_snapshots = []
+        first_attempted = threading.Event()
+
+        def analyzer(messages):
+            attempts.append(messages)
+            if len(attempts) == 1:
+                first_attempted.set()
+                raise RuntimeError("deliberate analyzer failure")
+            successful_snapshots.append(messages)
+
+        runtime = CounterpointRuntime(analyzer, CHANNEL_ID)
+        self.addCleanup(runtime.stop)
+        for index, user_id in enumerate(("U1", "U2", "U1", "U2"), start=1):
+            runtime.handle_message(message_body(f"{index}.0", user_id))
+        self.assertTrue(first_attempted.wait(1), "analyzer never raised")
+
+        runtime.handle_message(message_body("5.0", "U1"))
+        drain_thread = threading.Thread(target=runtime.drain, daemon=True)
+        drain_thread.start()
+        drain_thread.join(0.5)
+
+        self.assertFalse(drain_thread.is_alive(), "queue remained unfinished")
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(
+            [message["ts"] for message in successful_snapshots[0]],
+            ["1.0", "2.0", "3.0", "4.0", "5.0"],
+        )
+
+    def test_concurrent_submissions_keep_generation_and_enqueue_order_atomic(self):
+        snapshots = []
+        runtime = CounterpointRuntime(
+            lambda messages: snapshots.append(messages), CHANNEL_ID
+        )
+        self.addCleanup(runtime.stop)
+        for index, user_id in enumerate(("U1", "U2", "U1"), start=1):
+            runtime.handle_message(message_body(f"{index}.0", user_id))
+        runtime.drain()
+
+        first_put_entered = threading.Event()
+        release_first_put = threading.Event()
+        second_finished = threading.Event()
+        original_put = runtime.work_queue.put
+
+        def blocking_put(item):
+            if item[0] == "message" and item[1]["ts"] == "4.0":
+                first_put_entered.set()
+                release_first_put.wait(2)
+            original_put(item)
+
+        def submit_second():
+            runtime.handle_message(message_body("5.0", "U1"))
+            second_finished.set()
+
+        runtime.work_queue.put = blocking_put
+        self.addCleanup(release_first_put.set)
+
+        first = threading.Thread(
+            target=runtime.handle_message,
+            args=(message_body("4.0", "U2"),),
+        )
+        second = threading.Thread(target=submit_second)
+        first.start()
+        self.assertTrue(first_put_entered.wait(1), "first enqueue never paused")
+        second.start()
+        second_finished_early = second_finished.wait(0.25)
+        release_first_put.set()
+        first.join(1)
+        second.join(1)
+        runtime.drain()
+
+        self.assertFalse(second_finished_early, "second submit passed first generation")
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(
+            [message["ts"] for message in snapshots[0]],
+            ["1.0", "2.0", "3.0", "4.0"],
+        )
 
 
 class SlackHandlerTests(unittest.TestCase):

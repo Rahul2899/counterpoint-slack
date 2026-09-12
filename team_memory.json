@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "records": [
+    {
+      "id": "DEC-001",
+      "date": "2026-04-19",
+      "decision": "Move billing storage from Postgres to DynamoDB",
+      "concern": "Kai reported that the backfill and the rollback path were never costed",
+      "outcome": "A four-day estimate became 21 days and the migration was rolled back after two failed cutovers",
+      "source": "Synthetic demo decision record",
+      "status": "verified"
+    },
+    {
+      "id": "DEC-002",
+      "date": "2026-02-06",
+      "decision": "Replace the hosted identity provider with a self-hosted authentication service",
+      "concern": "Nobody owned password reset, session revocation, or the on-call rotation for the new service",
+      "outcome": "Launch slipped six weeks and a session-revocation gap kept 412 accounts signed in after a forced logout",
+      "source": "Synthetic demo decision record",
+      "status": "verified"
+    },
+    {
+      "id": "DEC-003",
+      "date": "2026-03-11",
+      "decision": "Ship the new checkout flow without a feature flag to save integration time",
+      "concern": "Priya asked how the team would disable the flow if conversion dropped",
+      "outcome": "A 9% conversion drop needed a 3-hour emergency redeploy because there was no kill switch",
+      "source": "Synthetic demo decision record",
+      "status": "verified"
+    },
+    {
+      "id": "DEC-004",
+      "date": "2025-11-24",
+      "decision": "Store EU customer analytics in the existing us-east-1 warehouse",
+      "concern": "Data residency commitments in two signed contracts were never checked before the choice",
+      "outcome": "A contractual review forced a regional warehouse rebuild that consumed 5 engineer-weeks",
+      "source": "Synthetic demo decision record",
+      "status": "verified"
+    },
+    {
+      "id": "DEC-005",
+      "date": "2025-09-30",
+      "decision": "Adopt a single vendor SDK for search, ranking, and analytics",
+      "concern": "Ravi warned that the contract had no export path and no pricing ceiling",
+      "outcome": "Renewal pricing rose 70% and the extraction project took two quarters",
+      "source": "Synthetic demo decision record",
+      "status": "verified"
+    },
+    {
+      "id": "DEC-006",
+      "date": "2026-01-15",
+      "decision": "Add live collaboration to the launch scope two weeks before the ship date",
+      "concern": "The team agreed quickly in chat without asking who would cut existing scope",
+      "outcome": "Launch shipped 18 days late and two committed integrations were dropped",
+      "source": "Synthetic demo decision record",
+      "status": "verified"
+    }
+  ]
+}

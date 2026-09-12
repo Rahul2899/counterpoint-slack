@@ -5,6 +5,7 @@ import types
 import unittest
 from unittest.mock import patch
 
+import app
 from app import CounterpointRuntime, create_slack_app, normalize_message
 
 
@@ -789,6 +790,174 @@ class SlackHandlerTests(unittest.TestCase):
         runtime.drain()
         self.assertEqual(len(client.posts), 1)
         self.assertEqual(slack_app.client.posts, [])
+
+
+class StartupTests(unittest.TestCase):
+    required = {
+        "SLACK_BOT_TOKEN": "xoxb-test",
+        "SLACK_APP_TOKEN": "xapp-test",
+        "SLACK_CHANNEL_ID": CHANNEL_ID,
+        "EXA_API_KEY": "exa-test",
+    }
+
+    def modules(self, *, handler_error=None):
+        calls = {"dotenv": 0, "handler": [], "handler_starts": 0}
+        dotenv = types.ModuleType("dotenv")
+
+        def load_dotenv():
+            calls["dotenv"] += 1
+
+        dotenv.load_dotenv = load_dotenv
+        counterpoint_agent = types.ModuleType("counterpoint_agent")
+        analyzer = object()
+        counterpoint_agent.analyze_window = analyzer
+        slack_bolt = types.ModuleType("slack_bolt")
+        apps = []
+
+        class ProductionSlack:
+            def auth_test(self):
+                return {"user_id": "UBOT"}
+
+        class ProductionBoltApp(FakeBoltApp):
+            def __init__(self, token):
+                super().__init__(token)
+                self.client = ProductionSlack()
+                apps.append(self)
+
+        slack_bolt.App = ProductionBoltApp
+        adapter = types.ModuleType("slack_bolt.adapter")
+        socket_mode = types.ModuleType("slack_bolt.adapter.socket_mode")
+
+        class FakeSocketModeHandler:
+            def __init__(self, slack_app, app_token):
+                calls["handler"].append((slack_app, app_token))
+
+            def start(self):
+                calls["handler_starts"] += 1
+                if handler_error is not None:
+                    raise handler_error
+
+        socket_mode.SocketModeHandler = FakeSocketModeHandler
+        adapter.socket_mode = socket_mode
+        slack_bolt.adapter = adapter
+        return {
+            "dotenv": dotenv,
+            "counterpoint_agent": counterpoint_agent,
+            "slack_bolt": slack_bolt,
+            "slack_bolt.adapter": adapter,
+            "slack_bolt.adapter.socket_mode": socket_mode,
+        }, calls, analyzer, apps
+
+    def test_missing_required_value_names_only_that_value(self):
+        for name in self.required:
+            with self.subTest(name=name):
+                env = self.required | {name: ""}
+                modules, _, _, _ = self.modules()
+                with patch.dict(os.environ, env, clear=True), patch.dict(sys.modules, {"dotenv": modules["dotenv"]}):
+                    with self.assertRaisesRegex(ValueError, f"^{name} is required$"):
+                        app.start_production()
+
+    def test_invalid_cooldown_is_rejected_before_production_imports(self):
+        for value in ("zero", "0", "-1"):
+            with self.subTest(value=value):
+                modules, _, _, _ = self.modules()
+                imported = []
+                original_import = __import__
+
+                def recording_import(name, *args, **kwargs):
+                    imported.append(name)
+                    return original_import(name, *args, **kwargs)
+
+                with patch.dict(os.environ, self.required | {"COUNTERPOINT_COOLDOWN_SECONDS": value}, clear=True), \
+                     patch.dict(sys.modules, modules), \
+                     patch("builtins.__import__", side_effect=recording_import):
+                    with self.assertRaisesRegex(ValueError, "^COUNTERPOINT_COOLDOWN_SECONDS must be a positive integer$"):
+                        app.start_production()
+                self.assertFalse(
+                    any(name == "counterpoint_agent" or name.startswith("slack_bolt") for name in imported)
+                )
+
+    def test_load_dotenv_precedes_environment_reads(self):
+        modules, _, _, _ = self.modules()
+
+        class Environment(dict):
+            loaded = False
+
+            def get(self, name, default=None):
+                if not self.loaded:
+                    raise AssertionError("environment read before load_dotenv")
+                return super().get(name, default)
+
+        environment = Environment(self.required)
+        modules["dotenv"].load_dotenv = lambda: setattr(environment, "loaded", True)
+        with patch.object(app.os, "environ", environment), patch.dict(sys.modules, modules):
+            app.start_production()
+
+    def test_production_startup_binds_authenticated_client_and_starts_once(self):
+        modules, calls, analyzer, apps = self.modules()
+        runtimes = []
+
+        class Runtime:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.slack_client = None
+                self.bot_user_id = None
+                self.started = 0
+                self.stopped = 0
+                runtimes.append(self)
+
+            def start(self):
+                self.started += 1
+
+            def stop(self):
+                self.stopped += 1
+
+        with patch.dict(os.environ, self.required, clear=True), \
+             patch.dict(sys.modules, modules), \
+             patch.object(app, "CounterpointRuntime", Runtime):
+            app.start_production()
+
+        self.assertEqual(calls["dotenv"], 1)
+        self.assertEqual(len(runtimes), 1)
+        runtime = runtimes[0]
+        self.assertIs(runtime.kwargs["analyzer"], analyzer)
+        self.assertEqual(runtime.kwargs["channel_id"], CHANNEL_ID)
+        self.assertFalse(runtime.kwargs["start_worker"])
+        self.assertEqual(runtime.kwargs["cooldown_seconds"], 90)
+        self.assertIs(runtime.slack_client, apps[0].client)
+        self.assertEqual(runtime.bot_user_id, "UBOT")
+        self.assertEqual(apps[0].token, "xoxb-test")
+        self.assertEqual(calls["handler"], [(apps[0], "xapp-test")])
+        self.assertEqual(calls["handler_starts"], 1)
+        self.assertEqual(runtime.started, 1)
+        self.assertEqual(runtime.stopped, 1)
+
+    def test_socket_mode_failure_stops_worker_and_preserves_exception(self):
+        modules, _, _, _ = self.modules(handler_error=RuntimeError("socket failed"))
+        runtimes = []
+
+        class Runtime:
+            def __init__(self, **kwargs):
+                self.slack_client = None
+                self.bot_user_id = None
+                self.started = 0
+                self.stopped = 0
+                runtimes.append(self)
+
+            def start(self):
+                self.started += 1
+
+            def stop(self):
+                self.stopped += 1
+
+        with patch.dict(os.environ, self.required, clear=True), \
+             patch.dict(sys.modules, modules), \
+             patch.object(app, "CounterpointRuntime", Runtime):
+            with self.assertRaisesRegex(RuntimeError, "^socket failed$"):
+                app.start_production()
+
+        self.assertEqual(runtimes[0].started, 1)
+        self.assertEqual(runtimes[0].stopped, 1)
 
 
 if __name__ == "__main__":

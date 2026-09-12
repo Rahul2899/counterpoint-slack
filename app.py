@@ -310,11 +310,11 @@ class CounterpointRuntime:
                 self.work_queue.task_done()
 
 
-def create_slack_app(runtime: CounterpointRuntime):
+def create_slack_app(runtime: CounterpointRuntime, bot_token: str | None = None):
     """Register message, /dissent, and reaction_added listeners."""
     from slack_bolt import App
 
-    slack_app = App(token=os.environ.get("SLACK_BOT_TOKEN"))
+    slack_app = App(token=bot_token or os.environ.get("SLACK_BOT_TOKEN"))
     if runtime.slack_client is None:
         runtime.slack_client = slack_app.client
 
@@ -338,3 +338,43 @@ def create_slack_app(runtime: CounterpointRuntime):
         return runtime.handle_reaction(body)
 
     return slack_app
+
+
+def start_production() -> None:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    config = {}
+    for name in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_CHANNEL_ID", "EXA_API_KEY"):
+        value = os.environ.get(name)
+        if not value:
+            raise ValueError(f"{name} is required")
+        config[name] = value
+    try:
+        cooldown_seconds = int(os.environ.get("COUNTERPOINT_COOLDOWN_SECONDS", "90"))
+    except ValueError:
+        raise ValueError("COUNTERPOINT_COOLDOWN_SECONDS must be a positive integer") from None
+    if cooldown_seconds <= 0:
+        raise ValueError("COUNTERPOINT_COOLDOWN_SECONDS must be a positive integer")
+
+    from counterpoint_agent import analyze_window
+    from slack_bolt.adapter.socket_mode import SocketModeHandler
+
+    runtime = CounterpointRuntime(
+        analyzer=analyze_window,
+        channel_id=config["SLACK_CHANNEL_ID"],
+        start_worker=False,
+        cooldown_seconds=cooldown_seconds,
+    )
+    slack_app = create_slack_app(runtime, config["SLACK_BOT_TOKEN"])
+    runtime.slack_client = slack_app.client
+    runtime.bot_user_id = slack_app.client.auth_test()["user_id"]
+    runtime.start()
+    try:
+        SocketModeHandler(slack_app, config["SLACK_APP_TOKEN"]).start()
+    finally:
+        runtime.stop()
+
+
+if __name__ == "__main__":
+    start_production()

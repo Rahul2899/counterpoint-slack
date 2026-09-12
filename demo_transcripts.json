@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "disclosure": "Every transcript below is synthetic. No real Slack message, real person, or private team discussion appears in this file.",
+  "transcripts": [
+    {
+      "name": "premature_auth_consensus",
+      "expected_action": "object",
+      "expected_evidence_ids": ["DEC-002"],
+      "note": "Two teammates close on self-hosted authentication without naming an owner for session revocation or the on-call cost.",
+      "messages": [
+        {"ts": "1776067200.000100", "user_id": "U01ALEXA", "text": "The identity vendor bill doubled again for next quarter."},
+        {"ts": "1776067260.000200", "user_id": "U02BRINA", "text": "Then lets just self-host auth. The library does most of it already."},
+        {"ts": "1776067320.000300", "user_id": "U01ALEXA", "text": "Agreed. Two weeks of work at most and we own the whole flow."},
+        {"ts": "1776067380.000400", "user_id": "U02BRINA", "text": "I can start the service on Monday and cut the vendor before renewal."},
+        {"ts": "1776067440.000500", "user_id": "U01ALEXA", "text": "Do it. I will tell finance we are dropping the contract."},
+        {"ts": "1776067500.000600", "user_id": "U02BRINA", "text": "Locked in. Moving it to the sprint board now."}
+      ]
+    },
+    {
+      "name": "healthy_auth_decision",
+      "expected_action": "abstain",
+      "expected_evidence_ids": [],
+      "note": "The same decision, but ownership, session revocation, rollback, and on-call are all addressed in the thread.",
+      "messages": [
+        {"ts": "1776153600.000100", "user_id": "U01ALEXA", "text": "Proposal: move auth in house before the renewal date."},
+        {"ts": "1776153660.000200", "user_id": "U03CHENG", "text": "Who owns password reset, session revocation, and the pager for it?"},
+        {"ts": "1776153720.000300", "user_id": "U02BRINA", "text": "I own the service and I am on the rotation. Revocation is in the design doc with a forced logout test."},
+        {"ts": "1776153780.000400", "user_id": "U03CHENG", "text": "Rollback plan? Last migration hurt because we could not go back."},
+        {"ts": "1776153840.000500", "user_id": "U02BRINA", "text": "We keep the vendor live in parallel for 30 days and can flip back in one config change."},
+        {"ts": "1776153900.000600", "user_id": "U01ALEXA", "text": "That covers the cost and the exit. Approved for the next sprint."}
+      ]
+    },
+    {
+      "name": "irrelevant_memory",
+      "expected_action": "abstain",
+      "expected_evidence_ids": [],
+      "note": "A low-risk naming choice closes quickly. No memory record is analogous, so precedent must not be invented.",
+      "messages": [
+        {"ts": "1776240000.000100", "user_id": "U03CHENG", "text": "Do we call the settings tab Preferences or Settings?"},
+        {"ts": "1776240060.000200", "user_id": "U01ALEXA", "text": "Settings. It matches the mobile app already."},
+        {"ts": "1776240120.000300", "user_id": "U02BRINA", "text": "Fine by me, it is a one line copy change."},
+        {"ts": "1776240180.000400", "user_id": "U03CHENG", "text": "Settings it is. Merging the copy update."}
+      ]
+    }
+  ]
+}

@@ -27,6 +27,7 @@ import logging
 import math
 import os
 import re
+import sys
 import threading
 import time
 import urllib.error
@@ -63,6 +64,8 @@ MAX_EVIDENCE_IDS = 2
 MEMORY_VERSION = 1
 MEMORY_FILENAME = "team_memory.json"
 MEMORY_PATH_ENV = "COUNTERPOINT_MEMORY_PATH"
+DEMO_FILENAME = "demo_transcripts.json"
+DEMO_VERSION = 1
 VERIFIED_STATUS = "verified"
 MAX_MEMORY_RECORDS = 50
 MAX_MEMORY_BYTES = 262_144
@@ -81,6 +84,17 @@ _RECORD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 _REASON_RE = re.compile(r"[^A-Za-z0-9 _.-]+")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _WHITESPACE_RE = re.compile(r"\s+")
+
+# Text Counterpoint must never publish into a channel: broadcast pings, raw
+# Slack mention syntax, and links. Evidence lives in memory, not on the web.
+_UNSAFE_TEXT_RE = re.compile(
+    r"<!(?:channel|here|everyone)>"
+    r"|<@[UWB][A-Za-z0-9]+>"
+    r"|<#C[A-Za-z0-9]+(?:\|[^>]*)?>"
+    r"|(?<![A-Za-z0-9_])@(?:channel|here|everyone)(?![A-Za-z0-9_])"
+    r"|https?://",
+    re.IGNORECASE,
+)
 
 _MEMORY_LOCK = threading.Lock()
 _MEMORY_CACHE: dict[str, Any] = {}
@@ -101,6 +115,9 @@ MAX_RESPONSE_BYTES = 1_048_576
 
 MAX_WINDOW_MESSAGES = 15
 MAX_MESSAGE_CHARS = 1_200
+MAX_SCANNED_MESSAGES = 100
+MAX_TRANSIENT_POLL_FAILURES = 2
+FATAL_HTTP_STATUSES = frozenset({400, 401, 403, 404, 405, 422})
 
 COMPLETED_STATUSES = frozenset({"completed", "complete", "succeeded", "success", "finished", "done"})
 FAILED_STATUSES = frozenset({"failed", "failure", "cancelled", "canceled", "error", "errored", "expired", "timed_out"})
@@ -279,6 +296,8 @@ def _validate_decision(raw: object, memory: list[dict[str, str]]) -> dict[str, o
         return _abstain("objection_too_long")
     if len(summary) > MAX_SUMMARY_CHARS or len(question) > MAX_QUESTION_CHARS:
         return _abstain("field_too_long")
+    if any(_UNSAFE_TEXT_RE.search(text) for text in (summary, objection, question)):
+        return _abstain("unsafe_text")
 
     evidence_raw = raw["evidence_ids"]
     if not isinstance(evidence_raw, list):
@@ -409,10 +428,10 @@ def _build_create_payload(
 
 def _normalize_messages(messages: object) -> list[dict[str, str]]:
     """Keep the newest well-formed messages; silently drop anything unusable."""
-    if not isinstance(messages, list):
+    if not isinstance(messages, (list, tuple)):
         return []
     window: list[dict[str, str]] = []
-    for item in messages:
+    for item in list(messages)[-MAX_SCANNED_MESSAGES:]:
         if not isinstance(item, dict):
             continue
         ts = _clean_text(item.get("ts"))[:32]
@@ -499,22 +518,48 @@ def _extract_run_id(document: dict[str, object]) -> str:
     return ""
 
 
-def _extract_output(document: dict[str, object]) -> dict[str, object] | None:
-    """Find the structured decision inside a run document, if it is there yet."""
-    for key in ("output", "result", "structuredOutput", "structured_output"):
-        if key not in document:
-            continue
-        value = document[key]
-        if isinstance(value, str):
-            try:
-                value = json.loads(value)
-            except ValueError:
-                return None
-        if isinstance(value, dict):
-            return value
+OUTPUT_CONTAINER_KEYS: tuple[str, ...] = (
+    "output",
+    "result",
+    "structuredOutput",
+    "structured_output",
+    "json",
+    "parsed",
+    "value",
+    "data",
+    "content",
+)
+MAX_OUTPUT_DEPTH = 3
+
+
+def _coerce_object(value: object) -> object:
+    """Parse a JSON string wrapper, leaving everything else untouched."""
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except ValueError:
+            return None
+    return value
+
+
+def _extract_output(document: object, depth: int = 0) -> dict[str, object] | None:
+    """Find the structured decision inside a run document, if it is there yet.
+
+    The Exa Agent API is beta, so the decision is located by a bounded search
+    through known envelope keys instead of one hard-coded path.
+    """
+    node = _coerce_object(document)
+    if not isinstance(node, dict):
         return None
-    if "action" in document and "evidence_ids" in document:
-        return document
+    if "action" in node:
+        return node
+    if depth >= MAX_OUTPUT_DEPTH:
+        return None
+    for key in OUTPUT_CONTAINER_KEYS:
+        if key in node:
+            found = _extract_output(node[key], depth + 1)
+            if found is not None:
+                return found
     return None
 
 
@@ -573,6 +618,7 @@ def _analyze_window(messages: object) -> dict[str, object]:
 
     run_id = _extract_run_id(document)
     status = _run_status(document)
+    transient_failures = 0
 
     for _ in range(MAX_POLL_ATTEMPTS):
         if status in COMPLETED_STATUSES:
@@ -600,7 +646,13 @@ def _analyze_window(messages: object) -> dict[str, object]:
                 "GET", run_url, api_key=api_key, timeout=_request_timeout(deadline)
             )
         except ProviderError as exc:
-            return _provider_abstention("GET", exc)
+            transient_failures += 1
+            fatal = exc.status in FATAL_HTTP_STATUSES
+            if fatal or transient_failures > MAX_TRANSIENT_POLL_FAILURES:
+                return _provider_abstention("GET", exc)
+            LOGGER.warning("exa poll retry after %s", exc.reason)
+            continue
+        transient_failures = 0
         status = _run_status(document)
 
     return _abstain("provider_timeout")
@@ -615,3 +667,86 @@ def _provider_abstention(method: str, error: ProviderError) -> dict[str, object]
         "exa %s failed: %s status=%s", method, error.reason, error.status or "none"
     )
     return _abstain(error.reason)
+
+
+# --- Offline demo fixtures and manual verification ---------------------------
+
+
+def _load_demo_transcripts(path: Path | None = None) -> dict[str, dict[str, object]]:
+    """Load the synthetic demo transcripts keyed by scenario name."""
+    target = Path(path) if path is not None else Path(__file__).resolve().parent / DEMO_FILENAME
+    document = json.loads(target.read_text(encoding="utf-8"))
+    if not isinstance(document, dict):
+        raise ValueError("demo document must be a JSON object")
+    if document.get("version") != DEMO_VERSION:
+        raise ValueError(f"demo version must be {DEMO_VERSION}")
+    entries = document.get("transcripts")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("demo file must contain a non-empty transcripts list")
+
+    scenarios: dict[str, dict[str, object]] = {}
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ValueError(f"transcript {index} must be a JSON object")
+        name = entry.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"transcript {index} has no name")
+        if name in scenarios:
+            raise ValueError(f"duplicate transcript name {name}")
+        expected = entry.get("expected_action")
+        if expected not in ("abstain", "object"):
+            raise ValueError(f"transcript {name} has an unusable expected_action")
+        expected_ids = entry.get("expected_evidence_ids")
+        if not isinstance(expected_ids, list) or not all(
+            isinstance(item, str) and item for item in expected_ids
+        ):
+            raise ValueError(f"transcript {name} has unusable expected_evidence_ids")
+        messages = _normalize_messages(entry.get("messages"))
+        if len(messages) != len(entry.get("messages") or []):
+            raise ValueError(f"transcript {name} contains a malformed message")
+        if not messages:
+            raise ValueError(f"transcript {name} has no messages")
+        scenarios[name] = {
+            "name": name,
+            "expected_action": expected,
+            "expected_evidence_ids": list(expected_ids),
+            "note": _clean_text(entry.get("note")),
+            "messages": messages,
+        }
+    return scenarios
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run one synthetic demo transcript against the live Exa Agent API.
+
+    Used only for manual verification. It needs EXA_API_KEY and network access;
+    the unit suite never touches it.
+    """
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    scenarios = _load_demo_transcripts()
+    names = ", ".join(scenarios)
+
+    if not arguments or arguments[0] in {"-h", "--help", "--list"}:
+        print(f"usage: python3 {Path(__file__).name} <transcript-name>")
+        print(f"transcripts: {names}")
+        return 0
+
+    name = arguments[0]
+    scenario = scenarios.get(name)
+    if scenario is None:
+        print(f"unknown transcript {name!r}; choose one of: {names}")
+        return 2
+
+    decision = analyze_window(list(scenario["messages"]))
+    print(json.dumps(decision, indent=2))
+    expected_action = scenario["expected_action"]
+    if decision["action"] != expected_action:
+        print(f"MISMATCH: expected {expected_action}, agent chose {decision['action']}")
+        return 1
+    print(f"OK: expected {expected_action}")
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - manual verification entry point
+    raise SystemExit(main())

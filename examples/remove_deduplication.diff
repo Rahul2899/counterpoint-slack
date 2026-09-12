@@ -1,9 +1,0 @@
-diff --git a/demo/src/webhook.py b/demo/src/webhook.py
-index 1111111..2222222 100644
---- a/demo/src/webhook.py
-+++ b/demo/src/webhook.py
-@@ -8,8 +8,5 @@ def handle_webhook(event):
--    if event_id in processed_event_ids:
--        return
--    processed_event_ids.add(event_id)
-     charge_customer(event)

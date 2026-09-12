@@ -1,0 +1,8 @@
+diff --git a/demo/src/webhook.py b/demo/src/webhook.py
+index 1111111..2222222 100644
+--- a/demo/src/webhook.py
++++ b/demo/src/webhook.py
+@@ -12,4 +12,5 @@ def handle_webhook(event):
+     processed_event_ids.add(event_id)
++    logger.info("processing webhook %s", event_id)
+     charge_customer(event)

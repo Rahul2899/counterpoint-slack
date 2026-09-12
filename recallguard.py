@@ -1,4 +1,7 @@
+import argparse
 import json
+import os
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -276,3 +279,45 @@ def run_review(scenario: str, root: Path = Path(".")) -> dict:
     result = review_diff(selected_diff, events, lessons)
     result["scenario"] = scenario
     return result
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="recallguard")
+    commands = parser.add_subparsers(dest="command", required=True)
+    check = commands.add_parser("check")
+    source = check.add_mutually_exclusive_group(required=True)
+    source.add_argument("--scenario", choices=tuple(SCENARIO_DIFF))
+    source.add_argument("--diff")
+    check.add_argument("--ai", action="store_true")
+    args = parser.parse_args(argv)
+
+    root = Path(__file__).parent
+    if args.scenario:
+        result = run_review(args.scenario, root)
+    else:
+        supplied_diff = sys.stdin.read() if args.diff == "-" else diff_text(
+            Path(args.diff)
+        )
+        result = review_diff(
+            supplied_diff,
+            ingest(root / "examples/multi_agent_events.jsonl"),
+            load_memory(root / "examples/project_memory.json"),
+        )
+
+    if args.ai:
+        result["ai_status"] = "unavailable"
+        if os.environ.get("OPENAI_API_KEY"):
+            try:
+                from agents_runtime import explain_scouts
+
+                result["ai_explanations"] = explain_scouts(result["scouts"])
+                result["ai_status"] = "complete"
+            except Exception:
+                pass
+
+    print(json.dumps(result, indent=2))
+    return {"PASS": 0, "UNKNOWN": 2, "BLOCK": 3}[result["verdict"]]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

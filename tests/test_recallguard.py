@@ -1,3 +1,6 @@
+import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -78,6 +81,66 @@ class RecallGuardTests(unittest.TestCase):
         findings = recallguard.analyze(diff, self.lessons)
 
         self.assertEqual(findings, [])
+
+    def test_cli_safe_scenario_prints_pass_json(self):
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "recallguard.py"),
+                "check",
+                "--scenario",
+                "safe",
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(json.loads(completed.stdout)["verdict"], "PASS")
+
+    def test_cli_stdin_blocks_harmful_diff(self):
+        harmful = recallguard.diff_text(
+            ROOT / "examples/remove_deduplication.diff"
+        )
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "recallguard.py"),
+                "check",
+                "--diff",
+                "-",
+            ],
+            cwd=ROOT,
+            input=harmful,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 3)
+        self.assertEqual(json.loads(completed.stdout)["verdict"], "BLOCK")
+
+    def test_cli_ai_flag_without_key_keeps_deterministic_verdict(self):
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "recallguard.py"),
+                "check",
+                "--scenario",
+                "safe",
+                "--ai",
+            ],
+            cwd=ROOT,
+            env={"PATH": "/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+        )
+
+        body = json.loads(completed.stdout)
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(body["verdict"], "PASS")
+        self.assertEqual(body["ai_status"], "unavailable")
 
 
 if __name__ == "__main__":

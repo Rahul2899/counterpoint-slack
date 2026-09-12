@@ -290,7 +290,7 @@ python3 -m venv .venv
 - [ ] Create the Slack app from slack_app_manifest.yaml, generate connections:write app token, install after all scopes exist, store credentials only in .env, create #war-room, and invite Counterpoint Dev.
 - [ ] Run all three demo transcripts through the real Exa API. Premature closure must object; both safe cases must abstain. If behavior fails, change only prompt or fixture evidence and rerun all three.
 - [ ] Two real humans type the premature-auth transcript. Verify one autonomous post, visible evidence ID, thumbs-down acknowledgement, and one ledger update. Run healthy transcript and verify silence.
-- [ ] Update README with setup, launch command, architecture, demo, synthetic-data disclosure, Exa beta/latency/privacy boundary, in-memory limit, and exact live verification.
+- [ ] Update README with setup, launch command, architecture, demo, synthetic-data disclosure, Exa latency/privacy boundary, in-memory limit, exact live verification, and a build-provenance section separating event-built Counterpoint code from third-party libraries and reusable planning material.
 - [ ] Run final unit suite and git status, then commit README.
 - [ ] Push and open Plan A pull request:
 
@@ -298,6 +298,15 @@ python3 -m venv .venv
 git push -u origin owner/plan-a-slack
 gh pr create --base main --head owner/plan-a-slack --title "Plan A: Slack runtime and Counterpoint integration" --body "Adds ambient Slack monitoring, serialized agent orchestration, native evidence cards, human dismissal, decision ledger, and verified integration instructions."
 ~~~
+
+## Submission Task S1 — repository owner
+
+- [ ] Confirm the repository is public and opens from a logged-out browser.
+- [ ] Prepare the project title and written description from verified behavior only.
+- [ ] Record a two-minute demo showing ambient detection, one grounded objection, thumbs-down dismissal, and ledger update.
+- [ ] Publish the required social post with the event-partner tags shown in the portal.
+- [ ] Complete the portal submission before its displayed deadline and verify every submitted link.
+- [ ] Be ready to explain that Counterpoint and its core functionality were built during the event; identify Slack Bolt, Exa, standard libraries, prompts, and planning templates as permitted building blocks.
 
 ## Final acceptance
 
@@ -310,3 +319,5 @@ gh pr create --base main --head owner/plan-a-slack --title "Plan A: Slack runtim
 - Thumbs-down dismisses exactly one intervention and updates ledger once.
 - /dissent never bypasses evidence requirements.
 - Repository contains no real credential or private Slack transcript.
+- Repository, video, and social-post links work for a logged-out judge.
+- README build provenance accurately distinguishes event work from reused building blocks.

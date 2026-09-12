@@ -1,0 +1,31 @@
+_metadata:
+  major_version: 2
+  minor_version: 1
+display_information:
+  name: Counterpoint Dev
+features:
+  bot_user:
+    display_name: Counterpoint Dev
+    always_online: false
+  slash_commands:
+    - command: /dissent
+      description: Ask Counterpoint to evaluate the current discussion
+      should_escape: false
+oauth_config:
+  scopes:
+    bot:
+      - channels:history
+      - chat:write
+      - reactions:read
+      - commands
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.channels
+      - reaction_added
+  interactivity:
+    is_enabled: true
+  org_deploy_enabled: false
+  # Generate the Socket Mode app token with app-level scope connections:write.
+  socket_mode_enabled: true
+  token_rotation_enabled: false

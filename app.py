@@ -182,6 +182,13 @@ class CounterpointRuntime:
 
     def _analyze(self, generation: int, respond=None) -> None:
         try:
+            if respond is None:
+                # A backlogged automatic run is already stale. Skipping before
+                # the call avoids spending a paid agent run on a window the
+                # worker will re-evaluate anyway. /dissent always runs.
+                with self._ingress_lock:
+                    if generation != self._generation:
+                        return
             decision = self.analyzer(list(self.window))
             with self._ingress_lock:
                 if generation != self._generation:

@@ -717,9 +717,12 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse(second_finished_early, "second submit passed first generation")
         self.assertFalse(first.is_alive())
         self.assertFalse(second.is_alive())
+        # The backlogged run for "4.0" is skipped as already stale, so the one
+        # analyzed window is the coalesced newest one, still in timestamp order.
+        self.assertEqual(len(snapshots), 1)
         self.assertEqual(
             [message["ts"] for message in snapshots[0]],
-            ["1.0", "2.0", "3.0", "4.0"],
+            ["1.0", "2.0", "3.0", "4.0", "5.0"],
         )
 
 

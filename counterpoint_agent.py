@@ -102,10 +102,13 @@ _MEMORY_CACHE: dict[str, Any] = {}
 # --- Exa Agent transport -----------------------------------------------------
 
 EXA_RUNS_URL = "https://api.exa.ai/agent/runs"
-EXA_BETA_HEADER = "agent-2026-05-07"
-EXA_EFFORT = "minimal"
-EXA_MAX_COST_DOLLARS = 0.05
 EXA_API_KEY_ENV = "EXA_API_KEY"
+
+# The fixed-price `minimal` effort caps cost by itself. `budget` is accepted
+# only for `auto` and `max` runs and starts at $1, so sending it here makes the
+# create call fail and silences Counterpoint. The standard Agent endpoint no
+# longer takes an `Exa-Beta` header either.
+EXA_EFFORT = "minimal"
 
 RUN_DEADLINE_SECONDS = 25.0
 POLL_INTERVAL_SECONDS = 0.5
@@ -421,7 +424,6 @@ def _build_create_payload(
     return {
         "input": _build_prompt(messages, memory),
         "effort": EXA_EFFORT,
-        "budget": {"maxCostDollars": EXA_MAX_COST_DOLLARS},
         "outputSchema": _output_schema(memory),
     }
 
@@ -483,7 +485,6 @@ def _request_json(
             "Content-Type": "application/json",
             "Accept": "application/json",
             "x-api-key": api_key,
-            "Exa-Beta": EXA_BETA_HEADER,
         },
     )
     try:

@@ -1,0 +1,4 @@
+{"agent_id":"claude-01","provider":"claude-code","task":"Simplify webhook processing","branch":"agent/claude-webhook","diff_path":"examples/remove_deduplication.diff","changed_paths":["demo/src/webhook.py"],"status":"ready"}
+{"agent_id":"codex-01","provider":"codex","task":"Improve payment logging","branch":"agent/codex-logging","diff_path":"examples/safe_change.diff","changed_paths":["demo/src/webhook.py"],"status":"ready"}
+{"agent_id":"gemini-01","provider":"gemini-cli","task":"Document retry behavior","branch":"agent/gemini-retry","diff_path":"examples/safe_change.diff","changed_paths":["demo/src/webhook.py"],"status":"ready"}
+{"agent_id":"cursor-01","provider":"cursor","task":"Update receipt comments","branch":"agent/cursor-receipts","diff_path":"examples/safe_change.diff","changed_paths":["demo/src/webhook.py"],"status":"ready"}

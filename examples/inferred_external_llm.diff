@@ -1,0 +1,6 @@
+diff --git a/demo/src/parser.py b/demo/src/parser.py
+index 1111111..2222222 100644
+--- a/demo/src/parser.py
++++ b/demo/src/parser.py
+@@ -3,3 +3,4 @@ def parse_document(document_text):
++    return external_llm(document_text)

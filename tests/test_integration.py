@@ -190,6 +190,8 @@ class PrematureClosureTests(IntegrationTestCase):
         self.assertIn("DEC-002", serialized)
         self.assertEqual(payload["effort"], "minimal")
         self.assertNotIn("budget", payload)
+        self.assertNotIn("input", payload)
+        self.assertIn("query", payload)
 
     def test_thumbs_down_stands_down_and_writes_one_ledger_row(self) -> None:
         self.always(completed_run())

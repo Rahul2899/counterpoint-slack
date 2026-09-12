@@ -129,6 +129,43 @@ FAILED_STATUSES = frozenset({"failed", "failure", "cancelled", "canceled", "erro
 _now = time.monotonic
 _sleep = time.sleep
 
+# Reason vocabulary. A reason outside both sets was written by the agent itself,
+# which means the agent really did judge the conversation and chose to abstain.
+PROVIDER_FAILURE_REASONS = frozenset(
+    {
+        "empty_window",
+        "missing_api_key",
+        "memory_unavailable",
+        "invalid_request",
+        "provider_http_error",
+        "provider_unreachable",
+        "provider_response_too_large",
+        "invalid_provider_json",
+        "invalid_provider_response",
+        "provider_failed",
+        "provider_timeout",
+        "missing_output",
+        "internal_error",
+    }
+)
+SUPPRESSION_REASONS = frozenset(
+    {
+        "invalid_output",
+        "invalid_output_keys",
+        "invalid_action",
+        "invalid_confidence",
+        "low_confidence",
+        "empty_field",
+        "objection_too_long",
+        "field_too_long",
+        "unsafe_text",
+        "invalid_evidence",
+        "invalid_evidence_count",
+        "unknown_evidence",
+        "unverified_evidence",
+    }
+)
+
 
 # --- Canonical abstention ----------------------------------------------------
 
@@ -405,9 +442,9 @@ def _output_schema(memory: list[dict[str, str]]) -> dict[str, object]:
 
 
 def _build_prompt(messages: list[dict[str, str]], memory: list[dict[str, str]]) -> str:
-    """Instructions, the complete memory, and the complete ordered transcript."""
+    """The complete memory and the complete ordered transcript, as data."""
     return (
-        f"{PROMPT_INSTRUCTIONS}\n"
+        "Decide whether to object or abstain for the discussion below.\n\n"
         "MEMORY (verified synthetic decision records, the only admissible "
         "evidence):\n"
         f"{json.dumps(memory, indent=2, ensure_ascii=False)}\n\n"
@@ -420,9 +457,14 @@ def _build_prompt(messages: list[dict[str, str]], memory: list[dict[str, str]]) 
 def _build_create_payload(
     messages: list[dict[str, str]], memory: list[dict[str, str]]
 ) -> dict[str, object]:
-    """The exact body posted to the Exa Agent create-run endpoint."""
+    """The exact body posted to the Exa Agent create-run endpoint.
+
+    `query` carries the task and is required. `input` is reserved for record
+    enrichment and must not be used for prompt text.
+    """
     return {
-        "input": _build_prompt(messages, memory),
+        "query": _build_prompt(messages, memory),
+        "systemPrompt": PROMPT_INSTRUCTIONS,
         "effort": EXA_EFFORT,
         "outputSchema": _output_schema(memory),
     }
@@ -519,8 +561,11 @@ def _extract_run_id(document: dict[str, object]) -> str:
     return ""
 
 
+# `output.structured` is where a completed run puts the schema-shaped result.
+# The rest are tolerated aliases, since the envelope is not guaranteed stable.
 OUTPUT_CONTAINER_KEYS: tuple[str, ...] = (
     "output",
+    "structured",
     "result",
     "structuredOutput",
     "structured_output",
@@ -529,6 +574,7 @@ OUTPUT_CONTAINER_KEYS: tuple[str, ...] = (
     "value",
     "data",
     "content",
+    "text",
 )
 MAX_OUTPUT_DEPTH = 3
 
@@ -741,11 +787,18 @@ def main(argv: list[str] | None = None) -> int:
 
     decision = analyze_window(list(scenario["messages"]))
     print(json.dumps(decision, indent=2))
+    reason = str(decision["reason"])
+    if reason in PROVIDER_FAILURE_REASONS:
+        print(f"NO JUDGMENT: the run failed before the agent answered ({reason})")
+        return 1
+    if reason in SUPPRESSION_REASONS:
+        print(f"SUPPRESSED: the agent answered and validation rejected it ({reason})")
+        return 1
     expected_action = scenario["expected_action"]
     if decision["action"] != expected_action:
         print(f"MISMATCH: expected {expected_action}, agent chose {decision['action']}")
         return 1
-    print(f"OK: expected {expected_action}")
+    print(f"OK: the agent chose {expected_action} on its own")
     return 0
 
 
